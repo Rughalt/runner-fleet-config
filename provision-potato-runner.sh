@@ -130,17 +130,6 @@ resolve_runner_name() {
     RUNNER_NAME="$(<"$NAME_FILE")"
     return
   fi
-  [[ "$MODE" == install ]] || return 0
-  local -a cakes=(
-    brownie cannoli cheesecake chiffon-cookie cupcake donut eclair flan
-    macaron madeleine millefeuille mochi muffin opera-cake panettone
-    pavlova red-velvet sacher shortcake strudel tiramisu tres-leches waffle
-  )
-  RUNNER_NAME="cakecat-${cakes[RANDOM % ${#cakes[@]}]}"
-  install -d -o root -g root -m 0700 "$STATE_DIR"
-  printf '%s\n' "$RUNNER_NAME" >"$NAME_FILE"
-  chmod 0600 "$NAME_FILE"
-  log "🎂 The potato adopted a random cakecat name: $RUNNER_NAME"
 }
 
 [[ $EUID -eq 0 ]] || die "Run this script as root (sudo)."
@@ -291,6 +280,64 @@ forgejo_runner_record() {
   endpoint="$(forgejo_runner_endpoint)"
   response="$(forgejo_api GET "$endpoint")"
   jq -c --arg n "$RUNNER_NAME" '(.runners? // . // [])[] | select(.name == $n)' <<<"$response" | head -n1
+}
+
+github_runner_names() {
+  local page=1 response total
+  while :; do
+    response="$(github_api GET "/orgs/$ORG/actions/runners?per_page=100&page=$page")"
+    jq -r '.runners[].name' <<<"$response"
+    total="$(jq -r '.total_count' <<<"$response")"
+    ((page * 100 >= total)) && break
+    ((page++))
+  done
+}
+
+forgejo_runner_names() {
+  forgejo_api GET "$(forgejo_runner_endpoint)" \
+    | jq -r '(.runners? // . // [])[] | .name'
+}
+
+choose_available_cakecat_name() {
+  [[ -n "$RUNNER_NAME" ]] && return 0
+  [[ "$MODE" == install ]] || return 0
+
+  local -a cakes=(
+    brownie cannoli cheesecake chiffon-cookie cupcake donut eclair flan
+    macaron madeleine millefeuille mochi muffin opera-cake panettone
+    pavlova red-velvet sacher shortcake strudel tiramisu tres-leches waffle
+  )
+  local start i candidate registered_names
+
+  if [[ "$RUNNER_PROVIDER" == github ]]; then
+    [[ -n "${GH_TOKEN:-}" ]] || die "GH_TOKEN is required before a free cakecat name can be selected."
+    [[ "$ORG" =~ ^[A-Za-z0-9_.-]+$ ]] || die "ORG is required and invalid."
+    github_api GET "/orgs/$ORG/actions/runners?per_page=1" >/dev/null \
+      || die "GH_TOKEN cannot inspect runners in $ORG."
+    registered_names="$(github_runner_names)"
+  else
+    [[ -n "$FORGEJO_URL" && -n "$FORGEJO_API_TOKEN" ]] \
+      || die "FORGEJO_URL and FORGEJO_API_TOKEN are required before a free cakecat name can be selected."
+    forgejo_api GET "$(forgejo_runner_endpoint)" >/dev/null \
+      || die "Forgejo token cannot inspect $FORGEJO_SCOPE runners."
+    registered_names="$(forgejo_runner_names)"
+  fi
+
+  start=$((RANDOM % ${#cakes[@]}))
+  for ((i=0; i<${#cakes[@]}; i++)); do
+    candidate="cakecat-${cakes[(start + i) % ${#cakes[@]}]}"
+    if ! grep -Fxq -- "$candidate" <<<"$registered_names"; then
+      RUNNER_NAME="$candidate"
+      install -d -o root -g root -m 0700 "$STATE_DIR"
+      printf '%s\n' "$RUNNER_NAME" >"$NAME_FILE"
+      chmod 0600 "$NAME_FILE"
+      log "🎂 The potato adopted the available cakecat name: $RUNNER_NAME"
+      return
+    fi
+    log "🍰 $candidate is already registered; tasting another cake."
+  done
+  RUNNER_NAME=""
+  die "Every built-in cakecat name is already registered. Set an unused RUNNER_NAME explicitly."
 }
 
 write_state() {
@@ -566,6 +613,7 @@ main() {
   host_apt ca-certificates curl git gnupg jq sudo tar gzip
   ensure_optional_swap
   ensure_runner_user
+  choose_available_cakecat_name
   assert_state_matches
   if [[ "$RUNNER_PROVIDER" == github ]]; then
     install_github_runner

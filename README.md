@@ -20,8 +20,11 @@ only trusted workflows on this machine.
 
 At first installation, an omitted `RUNNER_NAME` is randomly selected from a
 cake menu such as `cakecat-tiramisu`, `cakecat-brownie`, or `cakecat-pavlova`.
-The choice is persisted under `/etc/runner-fleet-config`, so reruns retain the
-same identity. You can instead set an explicit `cakecat-<cake>` name in `.env`.
+Before persisting the choice, the script checks the selected GitHub organization
+or Forgejo scope and skips cake names that are already registered. The choice is
+then persisted under `/etc/runner-fleet-config`, so reruns retain the same
+identity. You can instead set an explicit `cakecat-<cake>` name in `.env`; an
+occupied explicit name is reported rather than replaced automatically.
 
 For GitHub, copy the potato example and fill in the token and organization:
 
