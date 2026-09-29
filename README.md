@@ -10,6 +10,58 @@ provider credentials or a configured runner.
 Existing Docker on the host is not installed, removed, reconfigured, or restarted.
 Docker is installed inside the VMs.
 
+## Direct runner on a small Ubuntu host (Mikr.us potato)
+
+`provision-potato-runner.sh` installs exactly one persistent runner directly on
+an Ubuntu machine that already has a working Docker daemon. It does not use
+Incus and never installs, restarts, reconfigures, or prunes host Docker. Because
+the runner user belongs to the Docker group, treat it as root-equivalent and run
+only trusted workflows on this machine.
+
+At first installation, an omitted `RUNNER_NAME` is randomly selected from a
+cake menu such as `cakecat-tiramisu`, `cakecat-brownie`, or `cakecat-pavlova`.
+The choice is persisted under `/etc/runner-fleet-config`, so reruns retain the
+same identity. You can instead set an explicit `cakecat-<cake>` name in `.env`.
+
+For GitHub, copy the potato example and fill in the token and organization:
+
+```bash
+cp .env.potato.example .env
+nano .env
+chmod 600 .env
+sudo ./provision-potato-runner.sh
+```
+
+GitHub automatically supplies `self-hosted`, `Linux`, and the architecture label
+(`X64` on an amd64 Mikr.us). The provisioner adds `cakecat`, `potato`, and
+`mikrus`, allowing either a broad or narrow workflow selector:
+
+```yaml
+runs-on: [self-hosted, Linux, X64, cakecat, potato, mikrus]
+```
+
+To use the same potato with Forgejo instead, select `RUNNER_PROVIDER=forgejo`
+and provide `FORGEJO_URL`, `FORGEJO_API_TOKEN`, and a narrow
+`FORGEJO_SCOPE`. Forgejo jobs use the existing Docker daemon and the configured
+`FORGEJO_LABELS`; current Forgejo Runner v13 requires Docker 25 or newer. The
+downloaded Forgejo binary and detached signature are verified against Forgejo's
+published release-signing fingerprint before installation.
+
+Optional `HOST_SWAP_SIZE=1G` creates persistent swap only if the potato has no
+active swap; existing swap and a non-swap `/swapfile` are never overwritten.
+Passwordless sudo is disabled unless `RUNNER_PASSWORDLESS_SUDO=1` is explicitly
+set. Routine operations are idempotent:
+
+```bash
+sudo ./provision-potato-runner.sh --status
+sudo ./provision-potato-runner.sh --restart
+sudo ./provision-potato-runner.sh --cleanup
+```
+
+Cleanup requires the matching provider token and settings. It removes the
+managed service, files, and remote runner registration, but retains the Linux
+user and leaves Docker untouched.
+
 ## What it builds
 
 - Incus with a managed NAT bridge (`incusbr0` by default) and a dedicated
