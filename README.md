@@ -77,7 +77,7 @@ which you invoke the script:
 ```dotenv
 GH_TOKEN=github_pat_redacted
 RUNNER_COUNT=2
-VM_MEMORY=2048MiB
+VM_MEMORY=1536MiB
 ```
 
 Then run `sudo ./provision-seele-runners.sh`. The script reads `$PWD/.env`
@@ -128,7 +128,7 @@ Useful settings:
 | Variable | Default | Purpose |
 |---|---:|---|
 | `RUNNER_COUNT` | `2` | Creates deterministic names through `selee-trotter-NN`. |
-| `VM_CPUS` / `VM_MEMORY` / `VM_DISK` | `2` / `2048MiB` / `15GiB` | Per-VM limits. |
+| `VM_CPUS` / `VM_MEMORY` / `VM_DISK` | `2` / `1536MiB` / `15GiB` | Per-VM limits. |
 | `HOST_SWAP_SIZE` | `2G` | Creates `/swapfile` only when the host has no active swap. |
 | `GUEST_SWAP_SIZE` | `1G` | Persistent swap baked into the golden VM and its clones. |
 | `DAILY_CLEANUP` | `1` | Enables conservative daily cleanup inside runner VMs. |

@@ -66,7 +66,7 @@ INCUS_STORAGE_DRIVER="${INCUS_STORAGE_DRIVER:-auto}"
 INCUS_STORAGE_SOURCE="${INCUS_STORAGE_SOURCE:-}"
 POOL_SIZE_GIB="${POOL_SIZE_GIB:-}"
 VM_CPUS="${VM_CPUS:-2}"
-VM_MEMORY="${VM_MEMORY:-2048MiB}"
+VM_MEMORY="${VM_MEMORY:-1536MiB}"
 VM_DISK="${VM_DISK:-15GiB}"
 HOST_SWAP_SIZE="${HOST_SWAP_SIZE:-2G}"
 GUEST_SWAP_SIZE="${GUEST_SWAP_SIZE:-1G}"
@@ -123,7 +123,7 @@ Required environment:
 
 Common settings:
   RUNNER_COUNT=2           Number of VMs (selee-trotter-01, -02, ...).
-  VM_CPUS=2 VM_MEMORY=2048MiB VM_DISK=15GiB
+  VM_CPUS=2 VM_MEMORY=1536MiB VM_DISK=15GiB
   HOST_SWAP_SIZE=2G        Persistent swap on the VPS host (keeps existing swap).
   GUEST_SWAP_SIZE=1G       Persistent swap baked into the golden VM.
   DAILY_CLEANUP=1          Daily Docker/cache cleanup timer inside runner VMs.
