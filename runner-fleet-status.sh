@@ -135,25 +135,38 @@ print_host() {
 print_storage_pools() {
   command -v incus >/dev/null 2>&1 || return 0
   incus admin waitready --timeout=10 >/dev/null 2>&1 || { WARNINGS+=("🔴 Incus daemon is unavailable"); return; }
-  local pool driver used total pct raw_used raw_total used_b total_b
+  local pool driver used total pct raw_used raw_total resources info
   local -a rows=('POOL\tDRIVER\tUSED\tTOTAL\tUSE%')
   printf '\n💽 INCUS STORAGE\n'
   while IFS= read -r pool; do
     [[ -n "$pool" ]] || continue
     driver="$(incus storage show "$pool" 2>/dev/null | awk '$1=="driver:" {print $2; exit}')"
-    raw_used="$(incus storage info "$pool" 2>/dev/null | awk -F': ' '/space used:/ {print $2; exit}')"
-    raw_total="$(incus storage info "$pool" 2>/dev/null | awk -F': ' '/total space:/ {print $2; exit}')"
-    used="${raw_used:-unknown}"; total="${raw_total:-unknown}"; pct='-'
-    if [[ "$raw_used" =~ ^[0-9.]+[A-Za-z]+$ && "$raw_total" =~ ^[0-9.]+[A-Za-z]+$ ]] && command -v numfmt >/dev/null 2>&1; then
-      used_b="$(numfmt --from=iec-i "$raw_used" 2>/dev/null || true)"
-      total_b="$(numfmt --from=iec-i "$raw_total" 2>/dev/null || true)"
-      if [[ "$used_b" =~ ^[0-9]+$ && "$total_b" =~ ^[1-9][0-9]*$ ]]; then
-        pct="$((used_b * 100 / total_b))%"
-        percent_warning "Incus pool $pool" "$pct"
-      fi
+    resources="$(incus query "/1.0/storage-pools/$pool/resources" 2>/dev/null || true)"
+    raw_used="$(jq -r '.space.used // .metadata.space.used // empty' <<<"$resources" 2>/dev/null || true)"
+    raw_total="$(jq -r '.space.total // .metadata.space.total // empty' <<<"$resources" 2>/dev/null || true)"
+
+    # Older Incus clients can expose the endpoint differently. `--bytes` keeps
+    # this fallback independent of localized human-readable units.
+    if [[ ! "$raw_used" =~ ^[0-9]+$ || ! "$raw_total" =~ ^[1-9][0-9]*$ ]]; then
+      info="$(incus storage info "$pool" --bytes 2>/dev/null || true)"
+      raw_used="$(awk -F: 'tolower($1) ~ /space used/ {gsub(/[^0-9]/, "", $2); print $2; exit}' <<<"$info")"
+      raw_total="$(awk -F: 'tolower($1) ~ /total space/ {gsub(/[^0-9]/, "", $2); print $2; exit}' <<<"$info")"
+    fi
+
+    used=unknown; total=unknown; pct='-'
+    if [[ "$raw_used" =~ ^[0-9]+$ && "$raw_total" =~ ^[1-9][0-9]*$ ]]; then
+      used="$(human_bytes "$raw_used")"; total="$(human_bytes "$raw_total")"
+      pct="$((raw_used * 100 / raw_total))%"
+      percent_warning "Incus pool $pool" "$pct"
     fi
     rows+=("$pool\t${driver:-?}\t$used\t$total\t$pct")
-  done < <(incus storage list --format csv -c n 2>/dev/null)
+  done < <(
+    if command -v jq >/dev/null 2>&1; then
+      incus storage list --format json 2>/dev/null | jq -r '.[].name'
+    else
+      incus storage list --format csv -c n 2>/dev/null
+    fi
+  )
   printf '%b\n' "${rows[@]}" | print_table
 }
 
