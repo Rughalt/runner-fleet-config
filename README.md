@@ -65,6 +65,42 @@ Cleanup requires the matching provider token and settings. It removes the
 managed service, files, and remote runner registration, but retains the Linux
 user and leaves Docker untouched.
 
+## On-demand disk cleanup
+
+`cleanup-runner-disks.sh` reclaims disposable runner data without changing
+runner registrations. With no target option it discovers both provisioner-owned
+Incus runner VMs and the locally managed potato runner:
+
+```bash
+sudo ./cleanup-runner-disks.sh --dry-run
+sudo ./cleanup-runner-disks.sh
+```
+
+Use `--incus`, `--vm selee-trotter-01`, or `--local` to narrow the target.
+Normal cleanup removes stopped containers, old unused images and builder cache,
+stale GitHub workspaces, Go caches, apt cache, and old journals. In Incus VMs it
+also runs `fstrim`, allowing released guest blocks to be reclaimed by the CoW
+storage pool.
+
+`--aggressive` additionally removes all unused images/build cache and reusable
+GitHub Actions/tool caches. Docker volumes are never pruned. An active GitHub
+worker or Forgejo job container causes that VM to be skipped rather than
+interrupted. For an idle target, its runner service is briefly stopped to prevent
+a new job from arriving during deletion, then restored to its previous state.
+Stopped or errored VMs are also left stopped.
+
+The direct potato may share Docker with other host services, so local cleanup
+does not touch host Docker unless explicitly authorized:
+
+```bash
+sudo ./cleanup-runner-disks.sh --local --include-host-docker
+sudo ./cleanup-runner-disks.sh --local --aggressive --include-host-docker
+```
+
+That flag can remove unused Docker objects belonging to non-runner workloads;
+volumes are still excluded. Run `--dry-run` and `docker system df` first on a
+shared host.
+
 ## What it builds
 
 - Incus with a managed NAT bridge (`incusbr0` by default) and a dedicated
