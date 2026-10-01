@@ -92,7 +92,8 @@ docker_summary_vm() {
 }
 
 service_state_vm() {
-  local vm="$1" role="$2" service=""
+  local vm="${1:-}" role="${2:-}" service=""
+  [[ -n "$vm" && -n "$role" ]] || { printf 'missing'; return; }
   case "$role" in
     runner-v1|github-runner-v1)
       service="$(incus exec "$vm" -- sh -c 'cat /opt/actions-runner/.service 2>/dev/null' 2>/dev/null || true)"
@@ -200,7 +201,7 @@ print_runner_vms() {
         WARNINGS+=("🔴 $vm is ${state:-unknown}")
         continue
       fi
-      service="$(service_state_vm "$vm")"
+      service="$(service_state_vm "$vm" "$role")"
       load="$(incus exec "$vm" -- awk '{print $1}' /proc/loadavg 2>/dev/null || printf '?')"
       uptime="$(incus exec "$vm" -- awk '{printf "%dd%02dh", $1/86400, ($1%86400)/3600}' /proc/uptime 2>/dev/null || true)"
       mem_line="$(incus exec "$vm" -- free -b 2>/dev/null | awk '/^Mem:/ {print $2,$3}' || true)"
