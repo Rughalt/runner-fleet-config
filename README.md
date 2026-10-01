@@ -101,6 +101,25 @@ That flag can remove unused Docker objects belonging to non-runner workloads;
 volumes are still excluded. Run `--dry-run` and `docker system df` first on a
 shared host.
 
+## Fleet status dashboard
+
+`runner-fleet-status.sh` is a read-only overview of the host, Incus storage
+pools, every provisioner-owned runner VM in the current Incus project, and the
+direct potato runner when present:
+
+```bash
+sudo ./runner-fleet-status.sh
+sudo ./runner-fleet-status.sh --watch 10
+sudo ./runner-fleet-status.sh --no-docker
+```
+
+It reports host CPU/load, RAM, swap and root-disk space; Incus pool usage; and
+per-runner state, service health, resource limits, uptime, load, RAM, swap, root
+filesystem usage/free space, and Docker usage/reclaimable space. The health
+section highlights disks or pools above 80%, swap above 70%, stopped/error VMs,
+and inactive runner services. `--no-docker` provides a faster refresh when the
+Docker disk accounting calls are not needed.
+
 ## What it builds
 
 - Incus with a managed NAT bridge (`incusbr0` by default) and a dedicated
