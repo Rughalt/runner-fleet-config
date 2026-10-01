@@ -116,6 +116,28 @@ non-runner workloads. They never remove volumes attached to running or stopped
 containers, but an unattached volume may still contain valuable data. Run
 `--dry-run`, `docker system df -v`, and `docker volume ls` first on a shared host.
 
+## Growing runner storage
+
+`resize-runner-storage.sh` safely grows (never shrinks) an Incus-managed
+loop-backed pool and the root filesystems of provisioner-owned runner VMs. It
+refuses a pool it cannot prove belongs to this provisioner, preserves a host
+free-space reserve, and refuses to interrupt an active runner or Docker job.
+Use a dry run first:
+
+```bash
+sudo ./resize-runner-storage.sh --pool-size 48GiB --vm-size 20GiB --dry-run
+sudo ./resize-runner-storage.sh --pool-size 48GiB --vm-size 20GiB
+```
+
+Without `--vm`, every owned runner VM is resized sequentially. To grow only one
+Trotter, use `--vm selee-trotter-01`. Each selected runner service is paused,
+the VM is stopped and grown, the Ubuntu partition/filesystem is expanded, and
+the previous service state is restored. A failure leaves the runner disabled
+rather than feeding jobs to a half-resized VM. New golden images include
+`cloud-guest-utils`; an older runner must already have `growpart` available.
+The minimum host reserve defaults to 12 GiB and can be increased with
+`MIN_HOST_FREE_GIB`.
+
 ## Fleet status dashboard
 
 `runner-fleet-status.sh` is a read-only overview of the host, Incus storage

@@ -727,7 +727,7 @@ if ! apt_run "$force4" update; then
   force4=1
 fi
 
-packages=(build-essential ca-certificates curl docker.io docker-compose-v2 git jq libicu-dev libkrb5-3 libssl-dev
+packages=(build-essential ca-certificates cloud-guest-utils curl docker.io docker-compose-v2 git jq libicu-dev libkrb5-3 libssl-dev
           pkg-config rsync sudo tar unzip xz-utils zip zlib1g)
 if ! apt_run "$force4" install -y --no-install-recommends "${packages[@]}"; then
   [[ "${APT_FORCE_IPV4:-auto}" != 0 ]] || exit 1
