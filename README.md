@@ -91,6 +91,17 @@ interrupted. For an idle target, its runner service is briefly stopped to preven
 a new job from arriving during deletion, then restored to its previous state.
 Stopped or errored VMs are also left stopped.
 
+An owned runner VM whose root filesystem is at least 98% full enters emergency
+cleanup instead of being skipped as busy. The script stops and kills the runner
+service cgroup, terminates its active job containers, cleans the disk, and runs
+`fstrim`. Emergency cleanup automatically uses aggressive cache/image cleanup,
+but still requires the separate `--include-volumes` opt-in for unused volumes.
+A literal `No space left on device`/`ENOSPC` during ordinary cleanup
+triggers the same rescue followed by one retry. The runner service is restarted
+only after usage falls below 98%; otherwise it remains offline so GitHub or
+Forgejo cannot feed more jobs into the full VM. This automatic job termination
+is restricted to provisioner-owned Incus runner VMs and never targets host Docker.
+
 The direct potato may share Docker with other host services, so local cleanup
 does not touch host Docker unless explicitly authorized:
 

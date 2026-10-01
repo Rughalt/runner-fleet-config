@@ -11,6 +11,7 @@ AGGRESSIVE=0
 DRY_RUN=0
 INCLUDE_HOST_DOCKER=0
 INCLUDE_VOLUMES=0
+readonly EMERGENCY_DISK_PERCENT=98
 readonly LOCK_FILE=/run/lock/runner-fleet-disk-cleanup.lock
 readonly POTATO_STATE=/etc/runner-fleet-config/potato-runner.json
 readonly POTATO_GITHUB_DIR=/opt/actions-runner
@@ -103,6 +104,12 @@ vm_job_is_active() {
   '
 }
 
+vm_root_percent() {
+  local vm="$1"
+  incus exec "$vm" -- df -P / 2>/dev/null \
+    | awk 'NR==2 {gsub(/%/, "", $5); print $5}'
+}
+
 vm_runner_service() {
   local vm="$1" role service
   role="$(owned_vm_role "$vm")"
@@ -113,6 +120,25 @@ vm_runner_service() {
     forgejo-runner-v1) service=forgejo-runner.service ;;
   esac
   printf '%s\n' "${service:-}"
+}
+
+emergency_kill_vm_work() {
+  local vm="$1" service="$2"
+  warn "🚨 Emergency cleanup in '$vm': stopping the runner and terminating its current job."
+  if [[ -n "$service" ]]; then
+    incus exec "$vm" -- timeout 30 systemctl stop "$service" >/dev/null 2>&1 || true
+    incus exec "$vm" -- systemctl kill --kill-who=all --signal=SIGKILL "$service" >/dev/null 2>&1 || true
+  fi
+  incus exec "$vm" -- bash -c '
+    pkill -TERM -u runner -f "Runner.Worker" >/dev/null 2>&1 || true
+    sleep 2
+    pkill -KILL -u runner -f "Runner.Worker" >/dev/null 2>&1 || true
+    if command -v docker >/dev/null 2>&1; then
+      while IFS= read -r id; do
+        [[ -z "$id" ]] || docker kill "$id" >/dev/null 2>&1 || true
+      done < <(docker ps -q)
+    fi
+  '
 }
 
 local_job_is_active() {
@@ -202,13 +228,19 @@ GUEST
 
 cleanup_vm() {
   local vm="$1" state before after temp_cleaner service service_was_active=0
+  local before_pct after_pct emergency=0 cleanup_log cleanup_ok=0 cleanup_aggressive="$AGGRESSIVE"
   assert_owned_runner_vm "$vm"
   state="$(vm_state "$vm")"
   if [[ "$state" != RUNNING ]]; then
     warn "Skipping '$vm': state is ${state:-unknown}; cleanup never starts stopped/error VMs."
     return
   fi
-  if vm_job_is_active "$vm"; then
+  before_pct="$(vm_root_percent "$vm" || true)"
+  if [[ "$before_pct" =~ ^[0-9]+$ ]] && ((before_pct >= EMERGENCY_DISK_PERCENT)); then
+    emergency=1
+    cleanup_aggressive=1
+  fi
+  if vm_job_is_active "$vm" && [[ "$emergency" != 1 ]]; then
     warn "Skipping '$vm': an active runner worker or Docker job was detected."
     return
   fi
@@ -217,6 +249,8 @@ cleanup_vm() {
   before="$(human_root_usage_vm "$vm")"
   printf 'Before:\n%s\n' "$before"
   if [[ "$DRY_RUN" == 1 ]]; then
+    [[ "$emergency" != 1 ]] \
+      || printf 'Dry run: critical disk usage would trigger emergency runner/job termination.\n'
     printf 'Dry run: no files were removed.\n'
     return
   fi
@@ -227,30 +261,75 @@ cleanup_vm() {
   service="$(vm_runner_service "$vm")"
   if [[ -n "$service" ]] && incus exec "$vm" -- systemctl is-active --quiet "$service"; then
     service_was_active=1
-    incus exec "$vm" -- systemctl stop "$service"
+  fi
+  if [[ "$emergency" == 1 ]]; then
+    emergency_kill_vm_work "$vm" "$service"
+  elif [[ "$service_was_active" == 1 ]]; then
+    if ! incus exec "$vm" -- timeout 60 systemctl stop "$service"; then
+      rm -f -- "$temp_cleaner"
+      incus exec "$vm" -- systemctl start "$service" >/dev/null 2>&1 || true
+      warn "Skipping '$vm': its runner service did not stop cleanly."
+      return
+    fi
   fi
   if vm_job_is_active "$vm"; then
-    [[ "$service_was_active" != 1 ]] || incus exec "$vm" -- systemctl start "$service"
-    rm -f -- "$temp_cleaner"
-    warn "Skipping '$vm': work appeared while its runner service was being quiesced."
-    return
+    if [[ "$emergency" == 1 ]]; then
+      emergency_kill_vm_work "$vm" "$service"
+    else
+      [[ "$service_was_active" != 1 ]] || incus exec "$vm" -- systemctl start "$service"
+      rm -f -- "$temp_cleaner"
+      warn "Skipping '$vm': work appeared while its runner service was being quiesced."
+      return
+    fi
   fi
 
   if ! incus file push "$temp_cleaner" "$vm/run/runner-disk-cleanup"; then
     rm -f -- "$temp_cleaner"
-    [[ "$service_was_active" != 1 ]] || incus exec "$vm" -- systemctl start "$service" || true
+    if [[ "$service_was_active" == 1 && "$emergency" != 1 ]]; then
+      incus exec "$vm" -- systemctl start "$service" || true
+    fi
     die "Could not upload the cleaner to '$vm'."
   fi
   rm -f -- "$temp_cleaner"
-  if ! incus exec "$vm" -- bash /run/runner-disk-cleanup "$AGGRESSIVE" "$INCLUDE_VOLUMES"; then
-    incus exec "$vm" -- rm -f /run/runner-disk-cleanup || true
-    [[ "$service_was_active" != 1 ]] || incus exec "$vm" -- systemctl start "$service" || true
-    die "Cleanup failed inside '$vm'."
+  cleanup_log="$(mktemp -t runner-cleanup-log.XXXXXXXX)"
+  if incus exec "$vm" -- bash /run/runner-disk-cleanup "$cleanup_aggressive" "$INCLUDE_VOLUMES" \
+      2>&1 | tee "$cleanup_log"; then
+    cleanup_ok=1
+  elif grep -Eqi 'no space left on device|ENOSPC' "$cleanup_log"; then
+    warn "'$vm' reported ENOSPC; killing the runner job and retrying cleanup once."
+    emergency=1
+    cleanup_aggressive=1
+    emergency_kill_vm_work "$vm" "$service"
+    : >"$cleanup_log"
+    if incus exec "$vm" -- bash /run/runner-disk-cleanup "$cleanup_aggressive" "$INCLUDE_VOLUMES" \
+        2>&1 | tee "$cleanup_log"; then
+      cleanup_ok=1
+    fi
   fi
+  rm -f -- "$cleanup_log"
   incus exec "$vm" -- rm -f /run/runner-disk-cleanup || true
-  [[ "$service_was_active" != 1 ]] || incus exec "$vm" -- systemctl start "$service"
+  if [[ "$cleanup_ok" != 1 ]]; then
+    after_pct="$(vm_root_percent "$vm" || true)"
+    if { [[ "$after_pct" =~ ^[0-9]+$ ]] && ((after_pct >= EMERGENCY_DISK_PERCENT)); } \
+       || { [[ "$emergency" == 1 ]] && [[ ! "$after_pct" =~ ^[0-9]+$ ]]; }; then
+      die "Cleanup failed inside '$vm'; its runner stays stopped while disk usage is critical."
+    fi
+    if [[ "$service_was_active" == 1 ]]; then
+      incus exec "$vm" -- systemctl start "$service" || true
+    fi
+    die "Cleanup failed inside '$vm'; its previous runner service state was restored."
+  fi
   after="$(human_root_usage_vm "$vm")"
   printf 'After:\n%s\n' "$after"
+  after_pct="$(vm_root_percent "$vm" || true)"
+  if [[ "$after_pct" =~ ^[0-9]+$ ]] && ((after_pct >= EMERGENCY_DISK_PERCENT)); then
+    warn "'$vm' is still ${after_pct}% full; leaving its runner service stopped so it cannot accept more jobs."
+  elif [[ "$emergency" == 1 && ! "$after_pct" =~ ^[0-9]+$ ]]; then
+    warn "Could not verify free space after emergency cleanup; leaving '$vm' runner service stopped."
+  elif [[ "$service_was_active" == 1 ]]; then
+    incus exec "$vm" -- systemctl start "$service"
+    log "✅ '$vm' has space again; runner service restarted."
+  fi
 }
 
 discover_owned_runner_vms() {
