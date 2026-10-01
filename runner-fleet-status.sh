@@ -137,9 +137,16 @@ print_storage_pools() {
   command -v incus >/dev/null 2>&1 || return 0
   incus admin waitready --timeout=10 >/dev/null 2>&1 || { WARNINGS+=("🔴 Incus daemon is unavailable"); return; }
   local pool driver used total pct raw_used raw_total resources info
-  local -a rows=('POOL\tDRIVER\tUSED\tTOTAL\tUSE%')
+  local -a pool_names=() rows=('POOL\tDRIVER\tUSED\tTOTAL\tUSE%')
   printf '\n💽 INCUS STORAGE\n'
-  while IFS= read -r pool; do
+  mapfile -t pool_names < <(
+    if command -v jq >/dev/null 2>&1; then
+      incus storage list --format json 2>/dev/null | jq -r '.[].name'
+    else
+      incus storage list --format csv -c n 2>/dev/null
+    fi
+  )
+  for pool in "${pool_names[@]}"; do
     [[ -n "$pool" ]] || continue
     driver="$(incus storage show "$pool" 2>/dev/null | awk '$1=="driver:" {print $2; exit}')"
     resources="$(incus query "/1.0/storage-pools/$pool/resources" 2>/dev/null || true)"
@@ -161,43 +168,41 @@ print_storage_pools() {
       percent_warning "Incus pool $pool" "$pct"
     fi
     rows+=("$pool\t${driver:-?}\t$used\t$total\t$pct")
-  done < <(
-    if command -v jq >/dev/null 2>&1; then
-      incus storage list --format json 2>/dev/null | jq -r '.[].name'
-    else
-      incus storage list --format csv -c n 2>/dev/null
-    fi
-  )
+  done
   printf '%b\n' "${rows[@]}" | print_table
 }
 
 owned_runner_vms() {
   local vm role
+  local -a instances=()
   command -v incus >/dev/null 2>&1 || return 0
-  while IFS= read -r vm; do
+  mapfile -t instances < <(incus list --format csv -c n 2>/dev/null)
+  for vm in "${instances[@]}"; do
     [[ -n "$vm" ]] || continue
     role="$(incus config get "$vm" user.seele.role 2>/dev/null || true)"
     case "$role" in
       runner-v1|github-runner-v1|forgejo-runner-v1) printf '%s\t%s\n' "$vm" "$role" ;;
     esac
-  done < <(incus list --format csv -c n 2>/dev/null)
+  done
 }
 
 print_runner_vms() {
   command -v incus >/dev/null 2>&1 || { printf '\n🐗 INCUS RUNNERS: Incus not installed\n'; return; }
-  local found=0 vm role provider state service cpu_limit mem_limit uptime load
+  local found=0 record vm role provider state service cpu_limit mem_limit uptime load health
   local mem_used mem_total swap_used swap_total disk_used disk_total disk_free disk_pct docker
   local mem_line swap_line disk_line
-  local -a rows=('NAME\tPROVIDER\tSTATE\tSERVICE\tLIMIT\tLOAD\tRAM\tSWAP\tROOT\tFREE\tDOCKER')
+  local -a records=() rows=('NAME\tPROVIDER\tVM/UPTIME\tRUNNER SVC\tHEALTH\tLIMIT\tLOAD\tRAM\tSWAP\tROOT\tFREE\tDOCKER')
   printf '\n🐗 INCUS RUNNERS\n'
-  while IFS=$'\t' read -r vm role; do
+  mapfile -t records < <(owned_runner_vms)
+  for record in "${records[@]}"; do
+      IFS=$'\t' read -r vm role <<<"$record"
       [[ -n "$vm" ]] || continue
       found=1
       [[ "$role" == forgejo-runner-v1 ]] && provider=forgejo || provider=github
       state="$(incus list "$vm" --format csv -c s 2>/dev/null | head -n1)"
       cpu_limit="$(expanded_limit "$vm" limits.cpu)"; mem_limit="$(expanded_limit "$vm" limits.memory)"
       if [[ "$state" != RUNNING ]]; then
-        rows+=("$vm\t$provider\t${state:-?}\t-\t${cpu_limit:-?}CPU/${mem_limit:-?}\t-\t-\t-\t-\t-\t-")
+        rows+=("$vm\t$provider\t${state:-?}\t-\tNOT_RUNNING\t${cpu_limit:-?}CPU/${mem_limit:-?}\t-\t-\t-\t-\t-\t-")
         WARNINGS+=("🔴 $vm is ${state:-unknown}")
         continue
       fi
@@ -211,14 +216,23 @@ print_runner_vms() {
       read -r swap_total swap_used <<<"${swap_line:-0 0}"
       read -r disk_total disk_used disk_free disk_pct <<<"${disk_line:-? ? ? ?}"
       docker="$(docker_summary_vm "$vm")"
-      rows+=("$vm\t$provider\t$state/${uptime:-?}\t${service:-?}\t${cpu_limit:-?}CPU/${mem_limit:-?}\t$load\t$(human_bytes "${mem_used:-0}")/$(human_bytes "${mem_total:-0}")\t$(human_bytes "${swap_used:-0}")/$(human_bytes "${swap_total:-0}")\t${disk_used:-?}/${disk_total:-?}\t${disk_free:-?}\t${docker:-empty}")
+      health=OK
+      [[ "$service" == active ]] || health=SERVICE_DOWN
+      if [[ "${disk_pct%%%}" =~ ^[0-9]+$ ]]; then
+        if (( ${disk_pct%%%} >= 95 )); then
+          health=DISK_FULL
+        elif (( ${disk_pct%%%} >= 80 )) && [[ "$health" == OK ]]; then
+          health=DISK_HIGH
+        fi
+      fi
+      rows+=("$vm\t$provider\t$state/${uptime:-?}\t${service:-?}\t$health\t${cpu_limit:-?}CPU/${mem_limit:-?}\t$load\t$(human_bytes "${mem_used:-0}")/$(human_bytes "${mem_total:-0}")\t$(human_bytes "${swap_used:-0}")/$(human_bytes "${swap_total:-0}")\t${disk_used:-?}/${disk_total:-?}\t${disk_free:-?}\t${docker:-empty}")
       [[ "$service" == active ]] || WARNINGS+=("🔴 $vm runner service is ${service:-unknown}")
       percent_warning "$vm root disk" "${disk_pct:-}"
       if [[ "${swap_total:-0}" =~ ^[0-9]+$ && "${swap_used:-0}" =~ ^[0-9]+$ ]] \
          && ((swap_total > 0 && swap_used * 100 / swap_total >= 70)); then
         WARNINGS+=("🟠 $vm swap usage is $((swap_used * 100 / swap_total))%")
       fi
-  done < <(owned_runner_vms)
+  done
   printf '%b\n' "${rows[@]}" | print_table
   [[ "$found" == 1 ]] || printf 'No managed runner VMs found in the current Incus project.\n'
 }

@@ -83,7 +83,9 @@ also runs `fstrim`, allowing released guest blocks to be reclaimed by the CoW
 storage pool.
 
 `--aggressive` additionally removes all unused images/build cache and reusable
-GitHub Actions/tool caches. Docker volumes are never pruned. An active GitHub
+GitHub Actions/tool caches. Docker volumes are not pruned by default; add the
+separate `--include-volumes` switch to remove volumes Docker confirms are unused.
+An active GitHub
 worker or Forgejo job container causes that VM to be skipped rather than
 interrupted. For an idle target, its runner service is briefly stopped to prevent
 a new job from arriving during deletion, then restored to its previous state.
@@ -95,11 +97,13 @@ does not touch host Docker unless explicitly authorized:
 ```bash
 sudo ./cleanup-runner-disks.sh --local --include-host-docker
 sudo ./cleanup-runner-disks.sh --local --aggressive --include-host-docker
+sudo ./cleanup-runner-disks.sh --vm selee-trotter-01 --aggressive --include-volumes
 ```
 
-That flag can remove unused Docker objects belonging to non-runner workloads;
-volumes are still excluded. Run `--dry-run` and `docker system df` first on a
-shared host.
+The host-Docker and volume flags can remove unused objects belonging to
+non-runner workloads. They never remove volumes attached to running or stopped
+containers, but an unattached volume may still contain valuable data. Run
+`--dry-run`, `docker system df -v`, and `docker volume ls` first on a shared host.
 
 ## Fleet status dashboard
 
@@ -116,9 +120,11 @@ sudo ./runner-fleet-status.sh --no-docker
 It reports host CPU/load, RAM, swap and root-disk space; Incus pool usage; and
 per-runner state, service health, resource limits, uptime, load, RAM, swap, root
 filesystem usage/free space, and Docker usage/reclaimable space. The health
-section highlights disks or pools above 80%, swap above 70%, stopped/error VMs,
-and inactive runner services. `--no-docker` provides a faster refresh when the
-Docker disk accounting calls are not needed.
+column distinguishes the Incus VM state from actual runner health (`OK`,
+`DISK_HIGH`, `DISK_FULL`, `SERVICE_DOWN`, or `NOT_RUNNING`). The final section
+highlights disks or pools above 80%, swap above 70%, stopped/error VMs, and
+inactive runner services. `--no-docker` provides a faster refresh when the Docker
+disk accounting calls are not needed.
 
 ## What it builds
 

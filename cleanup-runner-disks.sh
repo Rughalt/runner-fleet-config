@@ -3,13 +3,14 @@ set -Eeuo pipefail
 shopt -s inherit_errexit
 
 # Reclaim disposable data from provisioner-managed runner VMs and/or the direct
-# potato runner. Docker volumes are never pruned.
+# potato runner. Docker volumes require a separate explicit opt-in.
 
 MODE=all
 TARGET_VM=""
 AGGRESSIVE=0
 DRY_RUN=0
 INCLUDE_HOST_DOCKER=0
+INCLUDE_VOLUMES=0
 readonly LOCK_FILE=/run/lock/runner-fleet-disk-cleanup.lock
 readonly POTATO_STATE=/etc/runner-fleet-config/potato-runner.json
 readonly POTATO_GITHUB_DIR=/opt/actions-runner
@@ -30,9 +31,12 @@ Usage:
 Options:
   --dry-run              Show targets and disk usage without deleting anything.
   --aggressive           Also drop reusable Actions/tool caches and all unused
-                         Docker images/build cache. Docker volumes remain safe.
+                         Docker images/build cache. Volumes still require the
+                         separate --include-volumes switch.
   --include-host-docker  Permit Docker pruning on a direct potato host. Without
                          this flag, local cleanup never touches host Docker.
+  --include-volumes      Also prune unused Docker volumes. This is never implied
+                         by --aggressive and must be requested separately.
   --help                 Show this help.
 
 Cleanup is skipped when an active GitHub worker or Forgejo job container is
@@ -52,6 +56,7 @@ while (($#)); do
     --dry-run) DRY_RUN=1; shift ;;
     --aggressive) AGGRESSIVE=1; shift ;;
     --include-host-docker) INCLUDE_HOST_DOCKER=1; shift ;;
+    --include-volumes) INCLUDE_VOLUMES=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) die "Unknown option: $1 (use --help)." ;;
   esac
@@ -129,7 +134,7 @@ clean_workspaces() {
 }
 
 clean_docker() {
-  local aggressive="$1"
+  local aggressive="$1" include_volumes="$2"
   if [[ "$aggressive" == 1 ]]; then
     docker container prune -f
     docker network prune -f
@@ -142,6 +147,9 @@ clean_docker() {
     docker builder prune -af --filter 'until=24h' --keep-storage 2GB \
       || docker builder prune -af --filter 'until=24h'
   fi
+  if [[ "$include_volumes" == 1 ]]; then
+    docker volume prune -af || docker volume prune -f
+  fi
 }
 
 write_guest_cleaner() {
@@ -150,6 +158,7 @@ write_guest_cleaner() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 aggressive="$1"
+include_volumes="$2"
 
 clean_workspaces() {
   local root="$1"
@@ -175,6 +184,9 @@ else
   docker image prune -af --filter 'until=168h'
   docker builder prune -af --filter 'until=24h' --keep-storage 2GB \
     || docker builder prune -af --filter 'until=24h'
+fi
+if [[ "$include_volumes" == 1 ]]; then
+  docker volume prune -af || docker volume prune -f
 fi
 
 clean_workspaces /opt/actions-runner/_work
@@ -230,7 +242,7 @@ cleanup_vm() {
     die "Could not upload the cleaner to '$vm'."
   fi
   rm -f -- "$temp_cleaner"
-  if ! incus exec "$vm" -- bash /run/runner-disk-cleanup "$AGGRESSIVE"; then
+  if ! incus exec "$vm" -- bash /run/runner-disk-cleanup "$AGGRESSIVE" "$INCLUDE_VOLUMES"; then
     incus exec "$vm" -- rm -f /run/runner-disk-cleanup || true
     [[ "$service_was_active" != 1 ]] || incus exec "$vm" -- systemctl start "$service" || true
     die "Cleanup failed inside '$vm'."
@@ -243,25 +255,29 @@ cleanup_vm() {
 
 discover_owned_runner_vms() {
   local vm role
+  local -a instances=()
   command -v incus >/dev/null 2>&1 || return 0
-  while IFS= read -r vm; do
+  mapfile -t instances < <(incus list --format csv -c n)
+  for vm in "${instances[@]}"; do
     [[ -n "$vm" ]] || continue
     role="$(owned_vm_role "$vm")"
     case "$role" in
       runner-v1|github-runner-v1|forgejo-runner-v1) printf '%s\n' "$vm" ;;
     esac
-  done < <(incus list --format csv -c n)
+  done
 }
 
 cleanup_all_incus() {
   command -v incus >/dev/null 2>&1 || { warn "Incus is not installed; no runner VMs to clean."; return; }
   incus admin waitready --timeout=60
   local found=0 vm
-  while IFS= read -r vm; do
+  local -a instances=()
+  mapfile -t instances < <(discover_owned_runner_vms)
+  for vm in "${instances[@]}"; do
     [[ -n "$vm" ]] || continue
     found=1
     cleanup_vm "$vm"
-  done < <(discover_owned_runner_vms)
+  done
   [[ "$found" == 1 ]] || warn "No provisioner-owned runner VMs were found in the current Incus project."
 }
 
@@ -319,10 +335,12 @@ cleanup_local() {
       runuser -u "$(jq -er '.user' "$POTATO_STATE")" -- go clean -cache -testcache || true
     fi
     if [[ "$INCLUDE_HOST_DOCKER" == 1 ]]; then
-      warn "Explicitly pruning unused HOST Docker objects; volumes remain untouched."
-      clean_docker "$AGGRESSIVE"
+      warn "Explicitly pruning unused HOST Docker objects."
+      clean_docker "$AGGRESSIVE" "$INCLUDE_VOLUMES"
     else
       log "Host Docker cleanup not authorized; leaving all host Docker objects untouched."
+      [[ "$INCLUDE_VOLUMES" != 1 ]] \
+        || warn "--include-volumes does not apply to host Docker without --include-host-docker."
     fi
     apt-get clean
     journalctl --vacuum-time=7d >/dev/null
