@@ -138,6 +138,18 @@ rather than feeding jobs to a half-resized VM. New golden images include
 The minimum host reserve defaults to 12 GiB and can be increased with
 `MIN_HOST_FREE_GIB`.
 
+For VM disks on Btrfs, both the provisioner and resize script set
+`size.state` to twice the root-disk size. This is quota headroom, not a second
+preallocated copy of the virtual disk. Btrfs CoW can temporarily account both
+old and rewritten extents of the VM disk image; without the 2x state quota it
+can return `ENOSPC` while the guest still appears to have free space. Repair
+existing Trotters without changing their root-disk sizes with:
+
+```bash
+sudo ./resize-runner-storage.sh --repair-btrfs-headroom --dry-run
+sudo ./resize-runner-storage.sh --repair-btrfs-headroom
+```
+
 ## Fleet status dashboard
 
 `runner-fleet-status.sh` is a read-only overview of the host, Incus storage

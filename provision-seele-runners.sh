@@ -386,6 +386,53 @@ storage_driver() {
   incus storage show "$1" 2>/dev/null | awk '$1 == "driver:" {print $2; exit}'
 }
 
+vm_disk_size_bytes() {
+  local value="$1"
+  [[ "$value" =~ ^([1-9][0-9]*)(MiB|GiB|TiB)$ ]] \
+    || die "VM_DISK must be a whole MiB/GiB/TiB value (for example 15GiB); got '$value'."
+  case "${BASH_REMATCH[2]}" in
+    MiB) printf '%s\n' "$((BASH_REMATCH[1] * 1024**2))" ;;
+    GiB) printf '%s\n' "$((BASH_REMATCH[1] * 1024**3))" ;;
+    TiB) printf '%s\n' "$((BASH_REMATCH[1] * 1024**4))" ;;
+  esac
+}
+
+double_vm_disk_size() {
+  local value="$1"
+  vm_disk_size_bytes "$value" >/dev/null
+  [[ "$value" =~ ^([1-9][0-9]*)(MiB|GiB|TiB)$ ]]
+  printf '%s%s\n' "$((BASH_REMATCH[1] * 2))" "${BASH_REMATCH[2]}"
+}
+
+set_vm_root_limits() {
+  local vm="$1" disk_size="$2" driver state_size current_size
+  local -a limits=(size="$disk_size")
+  current_size=$(incus query "/1.0/instances/$vm?recursion=1" 2>/dev/null | jq -r \
+    '.expanded_devices.root.size // .metadata.expanded_devices.root.size // empty' 2>/dev/null || true)
+  if [[ -n "$current_size" ]] \
+     && (( $(vm_disk_size_bytes "$current_size") > $(vm_disk_size_bytes "$disk_size") )); then
+    # A rerun must not undo a deliberate expansion performed after provisioning.
+    disk_size="$current_size"
+    limits=(size="$disk_size")
+  fi
+  driver="$(storage_driver "$INCUS_STORAGE_POOL")"
+  if [[ "$driver" == btrfs ]]; then
+    # Incus documents a 2x size.state requirement for VMs on Btrfs. A VM disk
+    # is a large mutable file; qgroups can temporarily account both the old and
+    # new immutable extents and otherwise report ENOSPC below the visible quota.
+    state_size="$(double_vm_disk_size "$disk_size")"
+    limits+=(size.state="$state_size")
+  fi
+  if incus config device show "$vm" | grep -q '^root:'; then
+    incus config device set "$vm" root "${limits[@]}"
+  else
+    incus config device override "$vm" root "${limits[@]}"
+  fi
+  if [[ "$driver" == btrfs ]]; then
+    log "🛡️  Btrfs CoW headroom for '$vm': root=$disk_size, size.state=$state_size"
+  fi
+}
+
 storage_status() {
   incus storage list --format csv -c ns 2>/dev/null | awk -F, -v pool="$1" '$1 == pool {print $2; exit}'
 }
@@ -847,6 +894,7 @@ ensure_base_vm() {
   if golden_snapshot_exists; then
     [[ "$(incus config get "$BASE_VM" user.seele.role)" == base-v1 ]] \
       || die "'$BASE_VM' has the expected snapshot name but is not owned by this provisioner."
+    set_vm_root_limits "$BASE_VM" "$VM_DISK"
     log "✨ Golden Trotter snapshot already exists; package installation is skipped."
     return
   fi
@@ -858,11 +906,7 @@ ensure_base_vm() {
     [[ "$(incus config get "$BASE_VM" user.seele.role)" == base-v1 ]] \
       || die "Instance '$BASE_VM' already exists and is not owned by this provisioner. Rename it or choose another BASE_VM."
   fi
-  if incus config device show "$BASE_VM" | grep -q '^root:'; then
-    incus config device set "$BASE_VM" root size="$VM_DISK"
-  else
-    incus config device override "$BASE_VM" root size="$VM_DISK"
-  fi
+  set_vm_root_limits "$BASE_VM" "$VM_DISK"
   if [[ "$(incus list "$BASE_VM" --format csv -c s | head -n1)" == RUNNING ]]; then
     log "Restarting the incomplete base VM so its Incus agent device is loaded"
     incus restart "$BASE_VM" --timeout 120 || incus restart "$BASE_VM" --force
@@ -1129,6 +1173,7 @@ ensure_runner_vm() {
     [[ "$(incus config get "$name" user.seele.role)" == runner-v1 ]] \
       || die "Instance '$name' already exists and is not owned by this provisioner. Rename it before continuing."
   fi
+  set_vm_root_limits "$name" "$VM_DISK"
   incus start "$name" 2>/dev/null || true
   wait_for_vm "$name"
 
@@ -1237,6 +1282,7 @@ ensure_forgejo_runner_vm() {
     [[ "$(incus config get "$name" user.seele.role)" == forgejo-runner-v1 ]] \
       || die "Instance '$name' already exists and is not an owned Forgejo runner."
   fi
+  set_vm_root_limits "$name" "$VM_DISK"
   incus start "$name" 2>/dev/null || true
   wait_for_vm "$name"
 

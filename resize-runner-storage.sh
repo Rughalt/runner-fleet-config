@@ -6,6 +6,7 @@ PROFILE="${INCUS_PROFILE:-seele-runners}"
 POOL="${INCUS_STORAGE_POOL:-}"
 POOL_SIZE=""
 VM_SIZE=""
+REPAIR_BTRFS_HEADROOM=0
 MIN_HOST_FREE_GIB="${MIN_HOST_FREE_GIB:-12}"
 DRY_RUN=0
 declare -a REQUESTED_VMS=()
@@ -16,12 +17,13 @@ die() { printf '\n❌ ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-Grow the Incus pool and/or root disks of provisioner-owned runner VMs.
+Grow Incus storage and repair Btrfs VM quota headroom for owned runners.
 Shrinking is never performed.
 
 Usage:
   sudo ./$SCRIPT_NAME --pool-size 48GiB --vm-size 20GiB
   sudo ./$SCRIPT_NAME --vm selee-trotter-01 --vm-size 20GiB
+  sudo ./$SCRIPT_NAME --repair-btrfs-headroom
   sudo ./$SCRIPT_NAME --pool-size 48GiB --dry-run
 
 Options:
@@ -29,6 +31,8 @@ Options:
   --pool-size SIZE  New size of an Incus-managed loop-backed pool
   --vm-size SIZE    New root-disk size for selected/all owned runner VMs
   --vm NAME         Resize only this VM; may be repeated
+  --repair-btrfs-headroom
+                     Set size.state to 2x root size on existing Btrfs VMs
   --dry-run         Show validated changes without applying them
   -h, --help        Show this help
 
@@ -44,13 +48,15 @@ while (($#)); do
     --pool-size) [[ $# -ge 2 ]] || die "--pool-size needs a value"; POOL_SIZE=$2; shift 2 ;;
     --vm-size) [[ $# -ge 2 ]] || die "--vm-size needs a value"; VM_SIZE=$2; shift 2 ;;
     --vm) [[ $# -ge 2 ]] || die "--vm needs a value"; REQUESTED_VMS+=("$2"); shift 2 ;;
+    --repair-btrfs-headroom) REPAIR_BTRFS_HEADROOM=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1" ;;
   esac
 done
 
-[[ -n "$POOL_SIZE" || -n "$VM_SIZE" ]] || { usage; die "Choose --pool-size and/or --vm-size."; }
+[[ -n "$POOL_SIZE" || -n "$VM_SIZE" || "$REPAIR_BTRFS_HEADROOM" == 1 ]] \
+  || { usage; die "Choose --pool-size, --vm-size and/or --repair-btrfs-headroom."; }
 [[ $EUID -eq 0 ]] || die "Run this script with sudo."
 
 for command in incus jq findmnt lsblk; do
@@ -76,6 +82,13 @@ size_to_bytes() {
 
 human_gib() { awk -v bytes="$1" 'BEGIN { printf "%.1f GiB", bytes / 1073741824 }'; }
 
+double_size_literal() {
+  local value=$1
+  size_to_bytes "$value" >/dev/null
+  [[ "$value" =~ ^([1-9][0-9]*)(MiB|GiB|TiB)$ ]]
+  printf '%s%s\n' "$((BASH_REMATCH[1] * 2))" "${BASH_REMATCH[2]}"
+}
+
 profile_value() {
   incus profile get "$PROFILE" "$1" 2>/dev/null || true
 }
@@ -88,6 +101,7 @@ if [[ -z "$POOL" ]]; then
 fi
 [[ -n "$POOL" ]] || die "Could not determine the Incus pool; pass --pool NAME."
 incus storage show "$POOL" >/dev/null 2>&1 || die "Incus pool '$POOL' does not exist."
+POOL_DRIVER=$(incus storage show "$POOL" | awk '$1 == "driver:" {print $2; exit}')
 
 pool_total_bytes() {
   incus query "/1.0/storage-pools/$POOL/resources" \
@@ -133,6 +147,41 @@ instance_json() {
 
 instance_role() {
   instance_json "$1" | jq -r '.config["user.seele.role"] // .metadata.config["user.seele.role"] // ""'
+}
+
+set_root_limits() {
+  local vm=$1 disk_size=$2 state_size
+  local -a limits=(size="$disk_size")
+  if [[ "$POOL_DRIVER" == btrfs ]]; then
+    state_size=$(double_size_literal "$disk_size")
+    limits+=(size.state="$state_size")
+  fi
+  if incus config device show "$vm" | grep -q '^root:'; then
+    incus config device set "$vm" root "${limits[@]}"
+  else
+    incus config device override "$vm" root "${limits[@]}"
+  fi
+}
+
+repair_vm_headroom() {
+  local vm=$1 current_size required_state current_state
+  incus info "$vm" >/dev/null 2>&1 || die "VM '$vm' does not exist."
+  case $(instance_role "$vm") in
+    runner-v1|github-runner-v1|forgejo-runner-v1) ;;
+    *) die "VM '$vm' is not an owned runner; refusing to change it." ;;
+  esac
+  current_size=$(instance_json "$vm" | jq -r \
+    '.expanded_devices.root.size // .metadata.expanded_devices.root.size // .devices.root.size // .metadata.devices.root.size // empty')
+  current_state=$(instance_json "$vm" | jq -r \
+    '.expanded_devices.root["size.state"] // .metadata.expanded_devices.root["size.state"] // .devices.root["size.state"] // .metadata.devices.root["size.state"] // empty')
+  [[ -n "$current_size" ]] || die "Could not determine root size of '$vm'."
+  required_state=$(double_size_literal "$current_size")
+  if [[ "$current_state" == "$required_state" ]]; then
+    log "🛡️  '$vm' already has Btrfs headroom: root=$current_size, size.state=$required_state"
+    return
+  fi
+  log "🛡️  Repairing '$vm' Btrfs quota headroom: root=$current_size, size.state=${current_state:-unset} → $required_state"
+  ((DRY_RUN)) || set_root_limits "$vm" "$current_size"
 }
 
 runner_service() {
@@ -203,7 +252,11 @@ resize_vm() {
   ((target_bytes >= current_bytes)) || die \
     "Refusing to shrink '$vm' from $current_size to $VM_SIZE."
   if ((target_bytes == current_bytes)); then
-    log "📦 '$vm' already has a $VM_SIZE root disk; nothing to do."
+    if [[ "$POOL_DRIVER" == btrfs ]]; then
+      repair_vm_headroom "$vm"
+    else
+      log "📦 '$vm' already has a $VM_SIZE root disk; nothing to do."
+    fi
     return
   fi
 
@@ -221,11 +274,7 @@ resize_vm() {
   incus exec "$vm" -- systemctl stop "$service"
   ((was_enabled == 0)) || incus exec "$vm" -- systemctl disable "$service" >/dev/null
   incus stop "$vm" --timeout 120 || incus stop "$vm" --force
-  if incus config device show "$vm" | grep -q '^root:'; then
-    incus config device set "$vm" root size="$VM_SIZE"
-  else
-    incus config device override "$vm" root size="$VM_SIZE"
-  fi
+  set_root_limits "$vm" "$VM_SIZE"
   incus start "$vm"
   if ! wait_for_agent "$vm"; then
     die "'$vm' was resized but its agent did not return. Runner service remains disabled for safety."
@@ -240,7 +289,7 @@ resize_vm() {
 
 if [[ -n "$POOL_SIZE" ]]; then grow_pool; fi
 
-if [[ -n "$VM_SIZE" ]]; then
+if [[ -n "$VM_SIZE" || "$REPAIR_BTRFS_HEADROOM" == 1 ]]; then
   if ((${#REQUESTED_VMS[@]} == 0)); then
     mapfile -t REQUESTED_VMS < <(
       incus list --format json | jq -r '.[]
@@ -252,7 +301,17 @@ if [[ -n "$VM_SIZE" ]]; then
     )
   fi
   ((${#REQUESTED_VMS[@]} > 0)) || die "No provisioner-owned runner VMs were found."
-  for vm in "${REQUESTED_VMS[@]}"; do resize_vm "$vm"; done
+  if [[ "$REPAIR_BTRFS_HEADROOM" == 1 && "$POOL_DRIVER" != btrfs ]]; then
+    log "🛡️  Pool '$POOL' uses '$POOL_DRIVER'; Btrfs 2x size.state repair is not needed."
+  else
+    for vm in "${REQUESTED_VMS[@]}"; do
+      if [[ -n "$VM_SIZE" ]]; then
+        resize_vm "$vm"
+      else
+        repair_vm_headroom "$vm"
+      fi
+    done
+  fi
 fi
 
-log "🌟 Storage expansion complete. Nothing was shrunk."
+log "🌟 Storage maintenance complete. Nothing was shrunk."
