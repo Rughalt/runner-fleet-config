@@ -476,6 +476,14 @@ available. An incomplete base VM is restarted on resume so a newly attached agen
 device is detected. The host dependency `genisoimage` is installed so Incus can
 build that agent CD-ROM.
 
+On x86_64 Ubuntu 26.04 (`resolute`), the UEFI payload is supplied by
+`ovmf-generic` rather than relying on the older `ovmf` package name. The
+provisioner selects the firmware package for the host architecture, verifies the
+OVMF CODE/VARS files, and restarts Incus so its cached QEMU feature check sees
+newly installed firmware. This fixes the otherwise misleading
+`Instance type "virtual-machine" is not supported` error whose daemon log says
+`Unable to locate a UEFI firmware`.
+
 Some VM images stop once during the initial Incus-agent/NoCloud handoff instead of
 remaining up across the requested guest reboot. The provisioner automatically
 starts such a VM again, up to two times, before treating repeated stops as a real

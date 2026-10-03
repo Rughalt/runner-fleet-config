@@ -373,16 +373,42 @@ preflight_host() {
 }
 
 install_incus() {
+  local architecture firmware_package
+  architecture="$(dpkg --print-architecture)"
+  case "$architecture" in
+    amd64)
+      # Ubuntu 26.04 split the actual x86_64 firmware files into
+      # ovmf-generic. Keep the old package name as a fallback for Noble and
+      # earlier releases.
+      if apt-cache show ovmf-generic >/dev/null 2>&1; then
+        firmware_package=ovmf-generic
+      else
+        firmware_package=ovmf
+      fi
+      ;;
+    arm64) firmware_package=qemu-efi-aarch64 ;;
+    *) die "No UEFI firmware package mapping for architecture '$architecture'." ;;
+  esac
+
   if command -v incus >/dev/null 2>&1; then
     log "⚙️  Incus engine already online: $(incus version 2>/dev/null | head -n1)"
   else
     log "⚙️  Assembling the Incus engine; host Docker stays outside the Fragmentum"
   fi
-  host_apt ca-certificates curl genisoimage jq qemu-system btrfs-progs lvm2 thin-provisioning-tools incus
+  host_apt ca-certificates curl genisoimage jq qemu-system qemu-utils swtpm "$firmware_package" btrfs-progs lvm2 thin-provisioning-tools incus
+
+  if [[ "$architecture" == amd64 ]]; then
+    [[ -r /usr/share/OVMF/OVMF_CODE_4M.fd && -r /usr/share/OVMF/OVMF_VARS_4M.fd ]] \
+      || die "The '$firmware_package' package did not provide a usable OVMF CODE/VARS pair under /usr/share/OVMF."
+  fi
+
   curl -4fsSI --connect-timeout 10 --max-time 20 "https://${RUNNER_CONNECT_HOST}:${RUNNER_CONNECT_PORT}/" >/dev/null \
     || curl -fsSI --connect-timeout 10 --max-time 20 "https://${RUNNER_CONNECT_HOST}:${RUNNER_CONNECT_PORT}/" >/dev/null \
     || die "Cannot reach $RUNNER_CONNECT_HOST over HTTPS."
   systemctl enable --now incus.service
+  # Incus performs and caches its QEMU/firmware capability checks at daemon
+  # startup, so restart it after installing a previously missing firmware.
+  systemctl restart incus.service
   incus admin waitready --timeout=60
 }
 
