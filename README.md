@@ -289,6 +289,7 @@ Useful settings:
 | Variable | Default | Purpose |
 |---|---:|---|
 | `RUNNER_COUNT` | `2` | Creates deterministic names through `selee-trotter-NN`. |
+| `RUNNER_LABELS` | `seele,selee-trotter,docker` | Extra comma-separated GitHub labels. |
 | `VM_CPUS` / `VM_MEMORY` / `VM_DISK` | `2` / `1536MiB` / `15GiB` | Per-VM limits. |
 | `HOST_SWAP_SIZE` | `2G` | Creates `/swapfile` only when the host has no active swap. |
 | `GUEST_SWAP_SIZE` | `1G` | Persistent swap baked into the golden VM and its clones. |
@@ -298,6 +299,25 @@ Useful settings:
 | `APT_FORCE_IPV4` | `auto` | Retry apt over IPv4; use `1` to force it immediately. |
 | `RUNNER_VERSION` | `latest` | Pin a runner version without the leading `v`. |
 | `REPLACE_OFFLINE_RUNNER` | `0` | Replace a verified stale same-named remote runner. |
+
+### Multiple runner classes on one host
+
+Use a separate env file, runner prefix, and base VM for every hardware class.
+The fleets can share the same Incus profile, network and storage pool. For
+example, provision a Flutter class and then a smaller general-purpose class:
+
+```bash
+sudo ENV_FILE="$PWD/.env.topaz-flutter" ./provision-seele-runners.sh
+sudo ENV_FILE="$PWD/.env.topaz-small" ./provision-seele-runners.sh
+```
+
+`RUNNER_LABELS` is applied during the first GitHub registration, so workflows
+can select only the larger workers with `runs-on: [self-hosted, flutter]`.
+Changing labels in the env does not silently re-register an existing runner;
+update its labels in GitHub or recreate that fleet deliberately. Each VM stores
+its fleet prefix as an ownership marker. `--cleanup` with one env file removes
+only that prefix and base VM, and retains a shared profile, pool and network
+while another fleet still uses them.
 
 ## Forgejo Actions: Lux and the Poro fleet
 

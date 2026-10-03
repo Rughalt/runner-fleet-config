@@ -28,7 +28,7 @@ load_local_env() {
     case "$key" in
       GH_TOKEN|ORG|RUNNER_GROUP|RUNNER_COUNT|RUNNER_PREFIX|BASE_VM|GOLDEN_SNAPSHOT|UBUNTU_IMAGE|\
       INCUS_NETWORK|INCUS_PROFILE|INCUS_STORAGE_POOL|INCUS_STORAGE_DRIVER|INCUS_STORAGE_SOURCE|\
-      CONFIRM_STORAGE_SOURCE|POOL_SIZE_GIB|VM_CPUS|VM_MEMORY|VM_DISK|RUNNER_VERSION|\
+      CONFIRM_STORAGE_SOURCE|POOL_SIZE_GIB|VM_CPUS|VM_MEMORY|VM_DISK|RUNNER_VERSION|RUNNER_LABELS|\
       APT_FORCE_IPV4|REPLACE_OFFLINE_RUNNER|SKIP_RESOURCE_CHECKS|MIN_HOST_CPUS|\
       MIN_HOST_RAM_MIB|MIN_HOST_DISK_GIB|FORGEJO_URL|FORGEJO_TOKEN|FORGEJO_API_TOKEN|\
       FORGEJO_RUNNER_VERSION|FORGEJO_RUNNER_COUNT|FORGEJO_RUNNER_PREFIX|FORGEJO_SCOPE|\
@@ -72,6 +72,7 @@ HOST_SWAP_SIZE="${HOST_SWAP_SIZE:-2G}"
 GUEST_SWAP_SIZE="${GUEST_SWAP_SIZE:-1G}"
 DAILY_CLEANUP="${DAILY_CLEANUP:-1}"
 RUNNER_VERSION="${RUNNER_VERSION:-latest}"
+RUNNER_LABELS="${RUNNER_LABELS:-seele,selee-trotter,docker}"
 FORGEJO_URL="${FORGEJO_URL:-}"
 FORGEJO_API_TOKEN="${FORGEJO_API_TOKEN:-${FORGEJO_TOKEN:-}}"
 FORGEJO_RUNNER_VERSION="${FORGEJO_RUNNER_VERSION:-13.1.0}"
@@ -123,6 +124,7 @@ Required environment:
 
 Common settings:
   RUNNER_COUNT=2           Number of VMs (selee-trotter-01, -02, ...).
+  RUNNER_LABELS=...        Extra GitHub labels (comma-separated).
   VM_CPUS=2 VM_MEMORY=1536MiB VM_DISK=15GiB
   HOST_SWAP_SIZE=2G        Persistent swap on the VPS host (keeps existing swap).
   GUEST_SWAP_SIZE=1G       Persistent swap baked into the golden VM.
@@ -158,6 +160,8 @@ esac
 [[ "$RUNNER_PROVIDER" =~ ^(github|forgejo)$ ]] || die "RUNNER_PROVIDER must be github or forgejo."
 [[ "$RUNNER_COUNT" =~ ^[1-9][0-9]*$ ]] || die "RUNNER_COUNT must be a positive integer."
 [[ "$VM_CPUS" =~ ^[1-9][0-9]*$ ]] || die "VM_CPUS must be a positive integer."
+[[ "$RUNNER_LABELS" =~ ^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$ ]] \
+  || die "RUNNER_LABELS must be a comma-separated list of simple GitHub labels."
 [[ "$MIN_HOST_RAM_MIB" =~ ^[1-9][0-9]*$ ]] || die "MIN_HOST_RAM_MIB must be a positive integer."
 [[ "$INCUS_STORAGE_DRIVER" =~ ^(auto|btrfs|lvm|zfs)$ ]] || die "Unsupported INCUS_STORAGE_DRIVER."
 [[ "$HOST_SWAP_SIZE" =~ ^(0|[1-9][0-9]*[MG])$ ]] || die "HOST_SWAP_SIZE must be 0 or look like 2G/2048M."
@@ -1032,10 +1036,17 @@ cleanup_owned_resources() {
   incus admin waitready --timeout=60
   log "🦋 Cleanup in the Sea of Quanta — discovering provisioner-owned resources"
 
-  local name role runner_id record profile_pool profile_network storage_owned network_owned
+  local name role runner_id record fleet_prefix profile_pool profile_network storage_owned network_owned
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     role="$(incus config get "$name" user.seele.role 2>/dev/null || true)"
+    fleet_prefix="$(incus config get "$name" user.seele.fleet_prefix 2>/dev/null || true)"
+    if [[ -n "$fleet_prefix" ]]; then
+      [[ "$fleet_prefix" == "$RUNNER_PREFIX" ]] || continue
+    else
+      # Backward compatibility for runners created before fleet markers existed.
+      [[ "$name" == "$RUNNER_PREFIX"-[0-9][0-9] ]] || continue
+    fi
     case "$role" in
       runner-v1|github-runner-v1)
         [[ -n "${GH_TOKEN:-}" ]] \
@@ -1081,6 +1092,13 @@ cleanup_owned_resources() {
   [[ "$(incus profile get "$INCUS_PROFILE" user.seele.managed)" == true ]] \
     || die "Profile '$INCUS_PROFILE' is not marked as owned; refusing to delete it."
 
+  if incus list --format json | jq -e --arg profile "$INCUS_PROFILE" \
+      '.[] | select((.profiles // []) | index($profile))' >/dev/null; then
+    log "Shared profile '$INCUS_PROFILE' is still used by another fleet; leaving its profile, storage and network untouched."
+    log "🦋✅ Selected fleet '$RUNNER_PREFIX' cleared; the other Topaz herd remains online."
+    return
+  fi
+
   profile_pool="$(incus profile get "$INCUS_PROFILE" user.seele.storage_pool)"
   [[ -n "$profile_pool" ]] || profile_pool="$(incus profile device get "$INCUS_PROFILE" root pool)"
   profile_network="$(incus profile get "$INCUS_PROFILE" user.seele.network)"
@@ -1119,7 +1137,7 @@ write_runner_install() {
   cat >"$TEMP_DIR/runner-install.sh" <<'GUEST'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-VM_NAME="$1" ORG="$2" RUNNER_GROUP="$3" REQUESTED_VERSION="$4" REPLACE="$5"
+VM_NAME="$1" ORG="$2" RUNNER_GROUP="$3" REQUESTED_VERSION="$4" REPLACE="$5" RUNNER_LABELS="$6"
 cd /opt/actions-runner
 [[ ! -e .runner ]] || exit 0
 
@@ -1152,7 +1170,7 @@ tar -xzf "$tmp" --no-same-owner
 chown -R runner:runner /opt/actions-runner
 token="$(</run/github-runner-registration-token)"
 args=(--unattended --url "https://github.com/$ORG" --token "$token" --name "$VM_NAME" \
-      --runnergroup "$RUNNER_GROUP" --work _work --labels seele,selee-trotter,docker)
+      --runnergroup "$RUNNER_GROUP" --work _work --labels "$RUNNER_LABELS")
 [[ "$REPLACE" != 1 ]] || args+=(--replace)
 runuser -u runner -- ./config.sh "${args[@]}"
 ./svc.sh install runner
@@ -1173,6 +1191,7 @@ ensure_runner_vm() {
     [[ "$(incus config get "$name" user.seele.role)" == runner-v1 ]] \
       || die "Instance '$name' already exists and is not owned by this provisioner. Rename it before continuing."
   fi
+  incus config set "$name" user.seele.fleet_prefix="$RUNNER_PREFIX"
   set_vm_root_limits "$name" "$VM_DISK"
   incus start "$name" 2>/dev/null || true
   wait_for_vm "$name"
@@ -1211,7 +1230,7 @@ ensure_runner_vm() {
   incus exec "$name" -- chmod 600 /run/github-runner-registration-token
   write_runner_install "$name" "$replace"
   incus file push "$TEMP_DIR/runner-install.sh" "$name/root/runner-install.sh"
-  if ! incus exec "$name" -- bash /root/runner-install.sh "$name" "$ORG" "$RUNNER_GROUP" "$RUNNER_VERSION" "$replace"; then
+  if ! incus exec "$name" -- bash /root/runner-install.sh "$name" "$ORG" "$RUNNER_GROUP" "$RUNNER_VERSION" "$replace" "$RUNNER_LABELS"; then
     incus exec "$name" -- rm -f /run/github-runner-registration-token /root/runner-install.sh || true
     die "Runner installation failed in $name. The VM was kept for inspection and will not be duplicated on rerun."
   fi
@@ -1282,6 +1301,7 @@ ensure_forgejo_runner_vm() {
     [[ "$(incus config get "$name" user.seele.role)" == forgejo-runner-v1 ]] \
       || die "Instance '$name' already exists and is not an owned Forgejo runner."
   fi
+  incus config set "$name" user.seele.fleet_prefix="$RUNNER_PREFIX"
   set_vm_root_limits "$name" "$VM_DISK"
   incus start "$name" 2>/dev/null || true
   wait_for_vm "$name"
