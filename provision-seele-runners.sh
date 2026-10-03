@@ -726,10 +726,15 @@ wait_for_vm() {
   ensure_unique_clone_dhcp_identity "$vm"
   local cloud_init_rc
   log "☁️ Waiting for cloud-init in '$vm' to finish"
-  set +e
-  incus exec "$vm" -- cloud-init status --wait >/dev/null
-  cloud_init_rc=$?
-  set -e
+  # Run this in an `if` condition so Bash suppresses both errexit and the ERR
+  # trap while we classify cloud-init's meaningful non-zero statuses below.
+  # Merely using `set +e` is insufficient because an active ERR trap still
+  # fires and aborts before the exit code can be inspected.
+  if incus exec "$vm" -- cloud-init status --wait >/dev/null; then
+    cloud_init_rc=0
+  else
+    cloud_init_rc=$?
+  fi
   case "$cloud_init_rc" in
     0) : ;;
     2)

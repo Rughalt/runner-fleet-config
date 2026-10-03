@@ -469,6 +469,8 @@ information and the VM console log for diagnosis.
 Cloud-init exit code `2` means it completed with recoverable warnings. The
 provisioner prints the detailed status and continues; exit code `1` or an unexpected
 failure remains fatal and includes the `cloud-final` journal in diagnostics.
+The status command is evaluated in a conditional so Bash's `ERR` trap cannot
+mistake that expected exit code `2` for an unhandled provisioning failure.
 
 The dedicated profile also attaches Incus' official `agent:config` CD-ROM fallback.
 This covers VPS environments where the normal 9p-based agent delivery is not
