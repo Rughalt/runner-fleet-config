@@ -395,7 +395,9 @@ install_incus() {
   else
     log "⚙️  Assembling the Incus engine; host Docker stays outside the Fragmentum"
   fi
-  host_apt ca-certificates curl genisoimage jq qemu-system qemu-utils swtpm "$firmware_package" btrfs-progs lvm2 thin-provisioning-tools incus
+  # --no-install-recommends keeps the host lean, but Ubuntu ships the SPICE
+  # backend used by Incus in a separate package, so it must be explicit.
+  host_apt ca-certificates curl genisoimage jq qemu-system qemu-utils qemu-system-modules-spice swtpm "$firmware_package" btrfs-progs lvm2 thin-provisioning-tools incus
 
   if [[ "$architecture" == amd64 ]]; then
     [[ -r /usr/share/OVMF/OVMF_CODE_4M.fd && -r /usr/share/OVMF/OVMF_VARS_4M.fd ]] \

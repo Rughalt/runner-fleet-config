@@ -484,6 +484,12 @@ newly installed firmware. This fixes the otherwise misleading
 `Instance type "virtual-machine" is not supported` error whose daemon log says
 `Unable to locate a UEFI firmware`.
 
+The QEMU SPICE backend is also installed explicitly as
+`qemu-system-modules-spice`. Ubuntu packages it separately and the provisioner
+uses `--no-install-recommends`; without the explicit dependency, Incus can pass
+its feature check but the first VM fails at `-spice` with `There is no option
+group 'spice'`.
+
 Some VM images stop once during the initial Incus-agent/NoCloud handoff instead of
 remaining up across the requested guest reboot. The provisioner automatically
 starts such a VM again, up to two times, before treating repeated stops as a real
