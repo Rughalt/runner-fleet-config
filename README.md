@@ -145,6 +145,11 @@ help, for example because the space sits in `_actions`/`_tool` caches that only
 `--aggressive` removes, in `_diag` diagnostic logs, or in a checkout that the
 previous staleness rule never noticed.
 
+It also reports files that were deleted but are still held open by a running
+process. Those blocks stay on the filesystem until the holder closes the file,
+so no cleanup can reclaim them and the only way out is to restart the holder.
+This is the reason behind "the disk is full but `du` does not explain it".
+
 The direct potato may share Docker with other host services, so local cleanup
 does not touch host Docker unless explicitly authorized:
 
@@ -158,6 +163,37 @@ The host-Docker and volume flags can remove unused objects belonging to
 non-runner workloads. They never remove volumes attached to running or stopped
 containers, but an unattached volume may still contain valuable data. Run
 `--dry-run`, `docker system df -v`, and `docker volume ls` first on a shared host.
+
+### Docker volumes are never pruned automatically
+
+Docker volumes are the one thing the cleanup never touches on its own, and they
+are the most common reason a runner VM keeps running out of space: unused
+volumes are invisible to `docker system prune`, they survive every normal
+cleanup, and they are not reported by `du` under the runner's workspace. A
+runner whose disk is filled by volumes stays full until they are pruned
+explicitly:
+
+```bash
+sudo ./cleanup-runner-disks.sh --vm selee-trotter-01 --include-volumes
+```
+
+The cleanup now says so explicitly when it finishes: it reports how much of
+unused volume space was left on the disk because `--include-volumes` was not
+given. `--analyze` shows the same volume figure under
+`with --include-volumes` in its reclaim estimate.
+
+The in-guest daily timer also leaves volumes alone by default, for the same
+reason. Set `DAILY_CLEANUP_VOLUMES=1` when the provisioner builds the runner
+images if that VM should prune its own unused volumes every night:
+
+```bash
+DAILY_CLEANUP=1 DAILY_CLEANUP_VOLUMES=1 sudo ./provision-seele-runners.sh
+```
+
+This only prunes volumes that no container references, but an unattached volume
+can still hold real data, so it stays opt-in. Because the timer is baked into
+the golden snapshot, existing clones keep the old behaviour until they are
+rebuilt.
 
 ## Growing runner storage
 
@@ -337,6 +373,7 @@ Useful settings:
 | `HOST_SWAP_SIZE` | `2G` | Creates `/swapfile` only when the host has no active swap. |
 | `GUEST_SWAP_SIZE` | `1G` | Persistent swap baked into the golden VM and its clones. |
 | `DAILY_CLEANUP` | `1` | Enables conservative daily cleanup inside runner VMs. |
+| `DAILY_CLEANUP_VOLUMES` | `0` | Also prune unused Docker volumes in that daily timer. |
 | `POOL_SIZE_GIB` | 60% of free, max 40 | New loop pool size in GiB (minimum 20). |
 | `INCUS_STORAGE_POOL` | auto | Reuse this existing Btrfs/LVM/ZFS pool. |
 | `APT_FORCE_IPV4` | `auto` | Retry apt over IPv4; use `1` to force it immediately. |

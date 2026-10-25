@@ -117,6 +117,46 @@ CONSTANTS
 
 write_cleanup_helpers() {
   cat <<'HELPERS'
+# Docker reports human sizes; the estimates need bytes.
+to_bytes() {
+  awk -v value="$1" 'BEGIN {
+    number = value + 0
+    unit = ""
+    if (match(value, /[kKmMgGtTpP]?[Bb]$/)) {
+      unit = tolower(substr(value, RSTART, 1))
+    }
+    if (unit == "k") number *= 1024
+    else if (unit == "m") number *= 1024 * 1024
+    else if (unit == "g") number *= 1024 * 1024 * 1024
+    else if (unit == "t") number *= 1024 * 1024 * 1024 * 1024
+    else if (unit == "p") number *= 1024 * 1024 * 1024 * 1024 * 1024
+    printf "%d", number
+  }'
+}
+
+human_bytes() {
+  local bytes="${1:-0}"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || printf '%sB' "$bytes"
+  else
+    printf '%sB' "$bytes"
+  fi
+}
+
+# Bytes Docker reports as reclaimable for one object type.
+docker_reclaimable_bytes() {
+  local wanted="$1" line type reclaim
+  while IFS= read -r line; do
+    type="${line%%|*}"
+    if [[ "$type" == "$wanted" ]]; then
+      reclaim="${line##*|}"
+      to_bytes "$reclaim"
+      return 0
+    fi
+  done < <(docker system df --format '{{.Type}}|{{.Reclaimable}}' 2>/dev/null || true)
+  printf '0\n'
+}
+
 # A workspace is stale when none of its files were touched recently.
 # The directory mtime is deliberately ignored: a repository that ran a job
 # today keeps a fresh mtime while its stale checkouts underneath survive.
@@ -244,6 +284,14 @@ else
 fi
 if [[ "$include_volumes" == 1 ]]; then
   docker volume prune -af || docker volume prune -f
+else
+  # Unused volumes are the one thing the cleaner never touches on its own,
+  # and they are a common reason a runner keeps running out of space.
+  reclaimable_volumes="$(docker_reclaimable_bytes 'Local Volumes')"
+  if [[ "$reclaimable_volumes" =~ ^[0-9]+$ ]] && ((reclaimable_volumes > 0)); then
+    printf '⚠️  %s of unused Docker volumes were NOT pruned (they need --include-volumes).\n' \
+      "$(human_bytes "$reclaimable_volumes")"
+  fi
 fi
 
 clean_workspaces "$work_dir" "$age_days" "$aggressive"
@@ -281,23 +329,6 @@ diag_dir="$2"
 age_days="$3"
 
 emit() { printf '%s\n' "$*"; }
-
-# Docker reports human sizes; the estimate needs bytes.
-to_bytes() {
-  awk -v value="$1" 'BEGIN {
-    number = value + 0
-    unit = ""
-    if (match(value, /[kKmMgGtTpP]?[Bb]$/)) {
-      unit = tolower(substr(value, RSTART, 1))
-    }
-    if (unit == "k") number *= 1024
-    else if (unit == "m") number *= 1024 * 1024
-    else if (unit == "g") number *= 1024 * 1024 * 1024
-    else if (unit == "t") number *= 1024 * 1024 * 1024 * 1024
-    else if (unit == "p") number *= 1024 * 1024 * 1024 * 1024 * 1024
-    printf "%d", number
-  }'
-}
 
 dir_bytes() {
   du -x -B1 -s "$1" 2>/dev/null | awk 'NR==1 {print $1; exit}'
@@ -340,6 +371,40 @@ dangling_volume_bytes() {
     total=$(( total + size ))
   done < <(docker volume ls -q --filter dangling=true 2>/dev/null || true)
   printf '%s\n' "$total"
+}
+
+# Space that was deleted but is still held open by a running process. The
+# directory entry is gone, so du cannot see it, yet the filesystem keeps the
+# blocks until the holder closes the file. No amount of cleanup reclaims it.
+deleted_open_files() {
+  local fd target key size pid comm total=0 count=0 top_bytes=0 top_holder=""
+  local -A seen=()
+  for fd in /proc/[0-9]*/fd/*; do
+    target="$(readlink "$fd" 2>/dev/null || true)"
+    case "$target" in
+      *"(deleted)") ;;
+      *) continue ;;
+    esac
+    # Anonymous memory files live in RAM, not on the filesystem.
+    case "$target" in
+      /memfd:*) continue ;;
+    esac
+    key="$(stat -L -c '%d:%i' "$fd" 2>/dev/null || true)"
+    [[ -n "$key" ]] || continue
+    [[ -z "${seen[$key]:-}" ]] || continue
+    seen["$key"]=1
+    size="$(stat -L -c %s "$fd" 2>/dev/null || echo 0)"
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+    count=$(( count + 1 ))
+    total=$(( total + size ))
+    if ((size > top_bytes)); then
+      top_bytes="$size"
+      pid="$(basename -- "$(dirname -- "$(dirname -- "$fd")")")"
+      comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo 'unknown')"
+      top_holder="${comm}:${pid}"
+    fi
+  done
+  printf 'count=%s|bytes=%s|top_bytes=%s|holder=%s\n' "$count" "$total" "$top_bytes" "$top_holder"
 }
 
 read -r total used free pct < <(df -PB1 / | awk 'NR==2 {gsub(/%/, "", $5); print $2, $3, $4, $5}')
@@ -409,6 +474,8 @@ else
 fi
 emit "CACHE|kind=go|bytes=$(dir_bytes /home/runner/.cache/go-build)"
 
+emit "DELETED|$(deleted_open_files)"
+
 if [[ -e /swapfile ]]; then
   emit "SWAP|bytes=$(stat -c %s /swapfile 2>/dev/null || echo 0)"
 fi
@@ -427,15 +494,6 @@ human_root_usage_local() {
 human_root_usage_vm() {
   local vm="$1"
   incus exec "$vm" -- df -hP / | awk 'NR==1 || NR==2'
-}
-
-human_bytes() {
-  local bytes="${1:-0}"
-  if command -v numfmt >/dev/null 2>&1; then
-    numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || printf '%sB' "$bytes"
-  else
-    printf '%sB' "$bytes"
-  fi
 }
 
 to_number() {
@@ -559,7 +617,8 @@ print_analysis() {
   local -a top_rows=() ws_rows=() ws_sub_rows=() docker_rows=() cache_rows=()
   local root_total=0 root_used=0 root_free=0 root_pct="" work_root=""
   local pct_display="?" shown=0
-  local volume_count=0 volume_bytes=0 swap_bytes=0
+  local volume_count=0 volume_bytes=0 swap_bytes=0 volumes_reclaim_bytes=0
+  local deleted_count=0 deleted_bytes=0 deleted_top_bytes=0 deleted_holder=""
   local est_normal=0 est_aggressive=0
   local -A cache_bytes=() cache_old=()
   local actions_bytes=0 tool_bytes=0
@@ -599,14 +658,22 @@ print_analysis() {
         ;;
       DOCKER)
         docker_rows+=("$(analysis_field "$line" type || echo '?')|$(analysis_field "$line" total || echo '?')|$(analysis_field "$line" reclaimable || echo '?')")
-        if [[ "$(analysis_field "$line" type || echo '')" == "Images" ]]; then
-          images_old_bytes="$(to_number "$(analysis_field "$line" old_bytes || echo 0)")"
-          images_reclaim_bytes="$(to_number "$(analysis_field "$line" reclaim_bytes || echo 0)")"
-        else
-          value="$(to_number "$(analysis_field "$line" reclaim_bytes || echo 0)")"
-          est_normal=$(( est_normal + value ))
-          est_aggressive=$(( est_aggressive + value ))
-        fi
+        case "$(analysis_field "$line" type || echo '')" in
+          Images)
+            images_old_bytes="$(to_number "$(analysis_field "$line" old_bytes || echo 0)")"
+            images_reclaim_bytes="$(to_number "$(analysis_field "$line" reclaim_bytes || echo 0)")"
+            ;;
+          Local\ Volumes)
+            # Volumes are never pruned without --include-volumes, so they
+            # must not inflate the normal or aggressive estimate.
+            volumes_reclaim_bytes="$(to_number "$(analysis_field "$line" reclaim_bytes || echo 0)")"
+            ;;
+          *)
+            value="$(to_number "$(analysis_field "$line" reclaim_bytes || echo 0)")"
+            est_normal=$(( est_normal + value ))
+            est_aggressive=$(( est_aggressive + value ))
+            ;;
+        esac
         ;;
       CACHE)
         kind="$(analysis_field "$line" kind || echo unknown)"
@@ -619,6 +686,12 @@ print_analysis() {
       VOLUME)
         volume_count="$(to_number "$(analysis_field "$line" count || echo 0)")"
         volume_bytes="$(to_number "$(analysis_field "$line" bytes || echo 0)")"
+        ;;
+      DELETED)
+        deleted_count="$(to_number "$(analysis_field "$line" count || echo 0)")"
+        deleted_bytes="$(to_number "$(analysis_field "$line" bytes || echo 0)")"
+        deleted_top_bytes="$(to_number "$(analysis_field "$line" top_bytes || echo 0)")"
+        deleted_holder="$(analysis_field "$line" holder || echo '')"
         ;;
       SWAP)
         swap_bytes="$(to_number "$(analysis_field "$line" bytes || echo 0)")"
@@ -713,9 +786,21 @@ print_analysis() {
     printf '   %8s  /swapfile (never removed automatically)\n' "$(human_bytes "$swap_bytes")"
   fi
 
+  if ((deleted_count > 0)); then
+    printf '\n⚠️  Deleted files still held open — no cleanup can reclaim these\n'
+    printf '   %8s  in %s deleted file(s), largest %s held by %s\n' \
+      "$(human_bytes "$deleted_bytes")" "$deleted_count" \
+      "$(human_bytes "$deleted_top_bytes")" "${deleted_holder:-unknown}"
+    printf '   The blocks stay on the filesystem until that process closes the file.\n'
+    printf '   Restart the holder (usually the runner service) to release the space.\n'
+  fi
+
   printf '\nReclaim estimate\n'
   printf '   normal cleanup           ~%s\n' "$(human_bytes "$est_normal")"
   printf '   aggressive cleanup       ~%s\n' "$(human_bytes "$est_aggressive")"
+  if ((volume_bytes < volumes_reclaim_bytes)); then
+    volume_bytes="$volumes_reclaim_bytes"
+  fi
   if ((volume_count > 0)); then
     printf '   with --include-volumes   ~%s  (%s unused volumes)\n' \
       "$(human_bytes "$(( est_aggressive + volume_bytes ))")" "$volume_count"
@@ -737,6 +822,7 @@ analyze_vm() {
   mapfile -t paths < <(vm_runner_paths "$vm")
   work_dir="${paths[0]:-}"
   diag_dir="${paths[1]:-}"
+  log "🔍 Analysing VM: $vm ($provider)"
   analyzer="$(mktemp -t runner-guest-analyze.XXXXXXXX)"
   write_guest_analyzer "$analyzer"
   if ! incus file push "$analyzer" "$vm/run/runner-disk-analyze"; then
@@ -745,9 +831,13 @@ analyze_vm() {
     return
   fi
   rm -f -- "$analyzer"
+  printf '   scanning %s, this can take a moment on a large filesystem...\n' "$vm"
   stream="$(incus exec "$vm" -- bash /run/runner-disk-analyze "$work_dir" "$diag_dir" "$WORKSPACE_MAX_AGE_DAYS" 2>/dev/null || true)"
   incus exec "$vm" -- rm -f /run/runner-disk-analyze >/dev/null 2>&1 || true
-  [[ -n "$stream" ]] || { warn "The analyzer returned no data for '$vm'."; return; }
+  if [[ -z "$stream" ]]; then
+    warn "The analyzer returned no data for '$vm'."
+    return
+  fi
   print_analysis "$vm" "$provider" "$stream"
 }
 
@@ -768,11 +858,16 @@ analyze_local() {
     work_dir="${home:-$FORGEJO_WORK_DIR}/work"
     diag_dir=""
   fi
+  log "🔍 Analysing local runner: $name ($provider)"
   analyzer="$(mktemp -t runner-host-analyze.XXXXXXXX)"
   write_guest_analyzer "$analyzer"
+  printf '   scanning the host filesystem, this can take a moment...\n'
   stream="$(bash "$analyzer" "$work_dir" "$diag_dir" "$WORKSPACE_MAX_AGE_DAYS" 2>/dev/null || true)"
   rm -f -- "$analyzer"
-  [[ -n "$stream" ]] || { warn "The analyzer returned no data for the local runner."; return; }
+  if [[ -z "$stream" ]]; then
+    warn "The analyzer returned no data for the local runner."
+    return
+  fi
   print_analysis "$name (local)" "$provider" "$stream"
 }
 
@@ -782,11 +877,15 @@ analyze_all_incus() {
   local vm
   local -a instances=()
   mapfile -t instances < <(discover_owned_runner_vms)
+  if ((${#instances[@]} == 0)); then
+    warn "No provisioner-owned runner VMs were found in the current Incus project."
+    return
+  fi
+  log "🔍 Analysing ${#instances[@]} runner VM(s)"
   for vm in "${instances[@]}"; do
     [[ -n "$vm" ]] || continue
     analyze_vm "$vm"
   done
-  ((${#instances[@]} > 0)) || warn "No provisioner-owned runner VMs were found in the current Incus project."
 }
 
 # ---------------------------------------------------------------------------
@@ -1040,6 +1139,12 @@ cleanup_local() {
     if [[ "$INCLUDE_HOST_DOCKER" == 1 ]]; then
       warn "Explicitly pruning unused HOST Docker objects."
       clean_docker "$AGGRESSIVE" "$INCLUDE_VOLUMES"
+      if [[ "$INCLUDE_VOLUMES" != 1 ]]; then
+        reclaimable_volumes="$(docker_reclaimable_bytes 'Local Volumes')"
+        if [[ "$reclaimable_volumes" =~ ^[0-9]+$ ]] && ((reclaimable_volumes > 0)); then
+          warn "$(human_bytes "$reclaimable_volumes") of unused HOST Docker volumes were NOT pruned (they need --include-volumes)."
+        fi
+      fi
     else
       log "Host Docker cleanup not authorized; leaving all host Docker objects untouched."
       [[ "$INCLUDE_VOLUMES" != 1 ]] \

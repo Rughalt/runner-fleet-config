@@ -32,7 +32,8 @@ load_local_env() {
       APT_FORCE_IPV4|REPLACE_OFFLINE_RUNNER|SKIP_RESOURCE_CHECKS|MIN_HOST_CPUS|\
       MIN_HOST_RAM_MIB|MIN_HOST_DISK_GIB|FORGEJO_URL|FORGEJO_TOKEN|FORGEJO_API_TOKEN|\
       FORGEJO_RUNNER_VERSION|FORGEJO_RUNNER_COUNT|FORGEJO_RUNNER_PREFIX|FORGEJO_SCOPE|\
-      FORGEJO_LABELS|RUNNER_PROVIDER|HOST_SWAP_SIZE|GUEST_SWAP_SIZE|DAILY_CLEANUP)
+      FORGEJO_LABELS|RUNNER_PROVIDER|HOST_SWAP_SIZE|GUEST_SWAP_SIZE|DAILY_CLEANUP|\
+      DAILY_CLEANUP_VOLUMES)
         if [[ ! -v "$key" ]]; then
           printf -v "$key" '%s' "$value"
           export "$key"
@@ -71,6 +72,7 @@ VM_DISK="${VM_DISK:-15GiB}"
 HOST_SWAP_SIZE="${HOST_SWAP_SIZE:-2G}"
 GUEST_SWAP_SIZE="${GUEST_SWAP_SIZE:-1G}"
 DAILY_CLEANUP="${DAILY_CLEANUP:-1}"
+DAILY_CLEANUP_VOLUMES="${DAILY_CLEANUP_VOLUMES:-0}"
 RUNNER_VERSION="${RUNNER_VERSION:-latest}"
 RUNNER_LABELS="${RUNNER_LABELS:-seele,selee-trotter,docker}"
 FORGEJO_URL="${FORGEJO_URL:-}"
@@ -129,6 +131,8 @@ Common settings:
   HOST_SWAP_SIZE=2G        Persistent swap on the VPS host (keeps existing swap).
   GUEST_SWAP_SIZE=1G       Persistent swap baked into the golden VM.
   DAILY_CLEANUP=1          Daily Docker/cache cleanup timer inside runner VMs.
+  DAILY_CLEANUP_VOLUMES=1  Also prune unused Docker volumes in that timer. Off by
+                          default: an unattached volume can still hold real data.
   INCUS_STORAGE_POOL=name  Reuse an existing Incus btrfs/lvm/zfs pool.
   POOL_SIZE_GIB=40         Size for a new safe loop-backed pool.
   RUNNER_VERSION=latest    Or pin, for example 2.328.0 (without "v").
@@ -167,6 +171,7 @@ esac
 [[ "$HOST_SWAP_SIZE" =~ ^(0|[1-9][0-9]*[MG])$ ]] || die "HOST_SWAP_SIZE must be 0 or look like 2G/2048M."
 [[ "$GUEST_SWAP_SIZE" =~ ^(0|[1-9][0-9]*[MG])$ ]] || die "GUEST_SWAP_SIZE must be 0 or look like 1G/1024M."
 [[ "$DAILY_CLEANUP" =~ ^[01]$ ]] || die "DAILY_CLEANUP must be 0 or 1."
+[[ "$DAILY_CLEANUP_VOLUMES" =~ ^[01]$ ]] || die "DAILY_CLEANUP_VOLUMES must be 0 or 1."
 if [[ "$RUNNER_PROVIDER" == forgejo ]]; then
   FORGEJO_URL="${FORGEJO_URL%/}"
   [[ "$FORGEJO_URL" =~ ^https://([^/:]+)(:([0-9]+))?$ ]] \
@@ -861,12 +866,17 @@ if pgrep -u runner -f 'Runner.Worker' >/dev/null 2>&1 \
 fi
 
 # Docker never prunes running containers or resources currently referenced by
-# them. Volumes are intentionally excluded.
+# them. Volumes are excluded unless the operator opted in explicitly, because
+# an unattached volume can still hold real data.
 docker container prune -f --filter 'until=24h'
 docker network prune -f --filter 'until=24h'
 docker image prune -af --filter 'until=168h'
 docker builder prune -af --filter 'until=24h' --keep-storage 2GB \
   || docker builder prune -af --filter 'until=24h'
+if [[ "${DAILY_CLEANUP_VOLUMES:-0}" == 1 ]]; then
+  # Only volumes that no container references are removed.
+  docker volume prune -af || docker volume prune -f
+fi
 
 # A workspace is stale when none of its files were touched recently. The
 # directory mtime is deliberately ignored: a repository that ran a job today
@@ -973,6 +983,10 @@ ExecStart=/usr/local/sbin/runner-daily-cleanup
 Nice=10
 IOSchedulingClass=idle
 UNIT
+  # The timer runs with a clean environment, so the volume opt-in has to be
+  # baked into the unit rather than inherited from the build.
+  printf 'Environment=DAILY_CLEANUP_VOLUMES=%s\n' "${DAILY_CLEANUP_VOLUMES:-0}" \
+    >> /etc/systemd/system/runner-daily-cleanup.service
 
   cat >/etc/systemd/system/runner-daily-cleanup.timer <<'TIMER'
 [Unit]
@@ -1035,6 +1049,7 @@ ensure_base_vm() {
     incus file push "$TEMP_DIR/base-bootstrap.sh" "$BASE_VM/root/base-bootstrap.sh"
     incus exec "$BASE_VM" --env APT_FORCE_IPV4="$APT_FORCE_IPV4" \
       --env GUEST_SWAP_SIZE="$GUEST_SWAP_SIZE" --env DAILY_CLEANUP="$DAILY_CLEANUP" \
+      --env DAILY_CLEANUP_VOLUMES="$DAILY_CLEANUP_VOLUMES" \
       -- bash /root/base-bootstrap.sh
     incus exec "$BASE_VM" -- rm -f /root/base-bootstrap.sh
   fi

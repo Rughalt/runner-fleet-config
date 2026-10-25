@@ -188,10 +188,12 @@ WSROOT|path=/opt/actions-runner/_work
 WS|name=my-repo|bytes=1000000000|stale=yes|newest=2026-10-19
 WSSUB|name=_actions|bytes=2000000000
 DOCKER|type=Images|total=4200000000|reclaimable=3100000000|total_bytes=4200000000|reclaim_bytes=3100000000|old_bytes=1000000000
+DOCKER|type=Local Volumes|total=11410000000|reclaimable=11410000000|total_bytes=11410000000|reclaim_bytes=11410000000|old_bytes=0
 DOCKER|type=Build Cache|total=1400000000|reclaimable=1400000000|total_bytes=1400000000|reclaim_bytes=1400000000|old_bytes=0
 CACHE|kind=apt|bytes=120000000|old_bytes=120000000
 CACHE|kind=journal|bytes=800000000|old_bytes=800000000
-CACHE|kind=diag|bytes=15000000|old_bytes=10000000'
+CACHE|kind=diag|bytes=15000000|old_bytes=10000000
+VOLUME|count=3|bytes=11410000000'
 
 REPORT="$(print_analysis "test-target" "github-runner-v1" "$ESTIMATE_STREAM")"
 
@@ -201,13 +203,41 @@ REPORT="$(print_analysis "test-target" "github-runner-v1" "$ESTIMATE_STREAM")"
 # aggressive = all workspace 1000000000 + images 3100000000 + _actions 2000000000
 #             + build cache 1400000000 + apt 120000000 + journal 800000000
 #             + diag 15000000 = 8435000000
+# volumes are excluded from both: they need --include-volumes
 NORMAL_EXPECTED="$(numfmt --to=iec-i --suffix=B 4320000000)"
 AGGRESSIVE_EXPECTED="$(numfmt --to=iec-i --suffix=B 8435000000)"
+VOLUMES_EXPECTED="$(numfmt --to=iec-i --suffix=B $((8435000000 + 11410000000)))"
 
 check "the normal estimate counts stale data only" grep -qF "normal cleanup           ~$NORMAL_EXPECTED" <<<"$REPORT"
 check "the aggressive estimate counts every reclaimable byte" grep -qF "aggressive cleanup       ~$AGGRESSIVE_EXPECTED" <<<"$REPORT"
+check "unused volumes are only counted with --include-volumes" grep -qF "with --include-volumes   ~$VOLUMES_EXPECTED" <<<"$REPORT"
 check "the report marks a stale checkout" grep -q 'lingering checkout' <<<"$REPORT"
 check "the report mentions the action cache" grep -q '_actions' <<<"$REPORT"
+
+echo
+echo "== deleted files held open =="
+
+# A file that is unlinked while a process still holds it open keeps its blocks
+# on the filesystem. Cleanup cannot reclaim it; only closing the fd can.
+DELETED_FILE="$WORK/held-open.log"
+head -c 4096 /dev/urandom >"$DELETED_FILE"
+exec 9<"$DELETED_FILE"
+# unlink, not rm: the file must really disappear from the directory while the
+# descriptor stays open.
+unlink "$DELETED_FILE"
+
+DELETED_LINE="$(bash -c '
+  source "'"$SCRIPT_DIR"'/cleanup-runner-disks.sh"
+  analyzer="$(mktemp)"
+  write_guest_analyzer "$analyzer"
+  bash "$analyzer" "" "" 1 2>/dev/null | grep "^DELETED|"
+  rm -f "$analyzer"
+')"
+
+DELETED_BYTES="$(sed -n 's/.*bytes=\([0-9]*\).*/\1/p' <<<"$DELETED_LINE")"
+check "the analyzer reports deleted files held open" test -n "$DELETED_BYTES"
+check "the analyzer counts the held-open bytes" test "$DELETED_BYTES" -ge 4096
+exec 9<&-
 
 echo
 echo "== command line =="
