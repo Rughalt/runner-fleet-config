@@ -78,9 +78,19 @@ sudo ./cleanup-runner-disks.sh
 
 Use `--incus`, `--vm selee-trotter-01`, or `--local` to narrow the target.
 Normal cleanup removes stopped containers, old unused images and builder cache,
-stale GitHub workspaces, Go caches, apt cache, and old journals. In Incus VMs it
-also runs `fstrim`, allowing released guest blocks to be reclaimed by the CoW
-storage pool.
+stale job workspaces, Go caches, apt cache, old journals, and runner diagnostic
+logs. In Incus VMs it also runs `fstrim`, allowing released guest blocks to be
+reclaimed by the CoW storage pool.
+
+A workspace counts as stale when none of the files inside it were touched
+recently. The directory timestamp is deliberately ignored: a repository that ran
+a job today keeps a fresh timestamp while the checkouts underneath it are still
+weeks old. Old checkouts of an actively used repository are therefore removed
+as well. Downloaded Actions and runner-tool versions are kept by default, but a
+version that has not been used for 30 days is pruned while the newest version
+of each package is always retained. GitHub runners keep their workspaces in
+`/opt/actions-runner/_work`, Forgejo runners in `/home/runner/work`; both are
+covered.
 
 `--aggressive` additionally removes all unused images/build cache and reusable
 GitHub Actions/tool caches. Docker volumes are not pruned by default; add the
@@ -90,6 +100,19 @@ worker or Forgejo job container causes that VM to be skipped rather than
 interrupted. For an idle target, its runner service is briefly stopped to prevent
 a new job from arriving during deletion, then restored to its previous state.
 Stopped or errored VMs are also left stopped.
+
+`--force` overrides that skip: it terminates the running job, force-kills a
+runner service that refuses to stop, and restarts the runner afterwards even
+when the runner was stopped before the cleanup. A runner whose disk is still at
+least 98% full after the cleanup stays offline, so `--force` never hands a full
+VM back to GitHub or Forgejo. Inside an Incus VM the job containers of that VM
+are terminated as well; on the direct potato only the runner worker process is
+killed, because host Docker containers may belong to unrelated services.
+
+```bash
+sudo ./cleanup-runner-disks.sh --force --vm selee-trotter-01
+sudo ./cleanup-runner-disks.sh --force --local
+```
 
 An owned runner VM whose root filesystem is at least 98% full enters emergency
 cleanup instead of being skipped as busy. The script stops and kills the runner
@@ -101,6 +124,26 @@ triggers the same rescue followed by one retry. The runner service is restarted
 only after usage falls below 98%; otherwise it remains offline so GitHub or
 Forgejo cannot feed more jobs into the full VM. This automatic job termination
 is restricted to provisioner-owned Incus runner VMs and never targets host Docker.
+
+### Finding what fills the disk
+
+`--analyze` reports what consumes the space instead of deleting it. It is
+read-only: nothing is removed, no service is stopped, no job is interrupted, and
+it works on busy and idle VMs alike.
+
+```bash
+sudo ./cleanup-runner-disks.sh --analyze
+sudo ./cleanup-runner-disks.sh --analyze --vm selee-trotter-01
+sudo ./cleanup-runner-disks.sh --analyze --local
+```
+
+The report lists the largest consumers of the root filesystem, breaks the runner
+workspaces down by size and age, flags lingering checkouts, shows what Docker
+would reclaim, and finishes with an estimate of what the normal, aggressive and
+volume-pruning cleanups would free. It answers why a previous cleanup did not
+help, for example because the space sits in `_actions`/`_tool` caches that only
+`--aggressive` removes, in `_diag` diagnostic logs, or in a checkout that the
+previous staleness rule never noticed.
 
 The direct potato may share Docker with other host services, so local cleanup
 does not touch host Docker unless explicitly authorized:
@@ -374,8 +417,11 @@ existing clones are intentionally not mutated behind your back.
 With `DAILY_CLEANUP=1`, every runner VM gets a persistent systemd timer. Once per
 day, with a randomized delay, it removes stopped containers and unused networks
 older than 24 hours, unused images older than 7 days, old builder cache, stale
-GitHub job workspaces, apt cache, and journals older than 7 days. Downloaded
-actions and tool caches are preserved, and Docker volumes are never pruned. The
+job workspaces, unused action and runner-tool versions older than 30 days,
+runner diagnostic logs older than 7 days, apt cache, and journals older than 7
+days. A workspace counts as stale when none of its files were touched recently,
+so old checkouts of a repository that is still in use are removed as well.
+Downloaded actions and tool caches are preserved, and Docker volumes are never pruned. The
 whole run is skipped while a GitHub worker or any Docker container is active.
 The timer cleans guests only; host Docker remains untouched.
 
