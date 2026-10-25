@@ -868,13 +868,90 @@ docker image prune -af --filter 'until=168h'
 docker builder prune -af --filter 'until=24h' --keep-storage 2GB \
   || docker builder prune -af --filter 'until=24h'
 
-# Remove stale GitHub job workspaces but preserve downloaded actions and tools.
-if [[ -d /opt/actions-runner/_work ]]; then
-  find /opt/actions-runner/_work -mindepth 1 -maxdepth 1 -type d -mtime +1 \
-    ! -name _actions ! -name _tool ! -name _temp -exec rm -rf -- {} +
-  [[ ! -d /opt/actions-runner/_work/_temp ]] \
-    || find /opt/actions-runner/_work/_temp -mindepth 1 -mtime +1 -delete
+# A workspace is stale when none of its files were touched recently. The
+# directory mtime is deliberately ignored: a repository that ran a job today
+# keeps a fresh mtime while its stale checkouts underneath survive.
+workspace_is_stale() {
+  local dir="$1" age_days="$2"
+  [[ -d "$dir" ]] || return 1
+  find "$dir" -xdev -type f -newermt "-${age_days} days" -print -quit 2>/dev/null \
+    | grep -q . && return 1
+  return 0
+}
+
+# Remove runner workspaces, keeping the downloaded actions and tool caches.
+clean_workspaces() {
+  local root="$1" age_days="$2" dir name
+  [[ -d "$root" ]] || return 0
+  while IFS= read -r -d '' dir; do
+    name="$(basename -- "$dir")"
+    case "$name" in
+      _actions|_tool|_temp) continue ;;
+    esac
+    if workspace_is_stale "$dir" "$age_days"; then
+      rm -rf -- "$dir"
+    fi
+  done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -print0)
+}
+
+# Remove the runner's temporary job directories. The old-directory list is
+# captured before the files are deleted, because deleting a file refreshes the
+# mtime of its parent. Directories are removed with rmdir, which tolerates a
+# directory that still holds recent files instead of aborting the cleanup.
+clean_temp() {
+  local root="$1" age_days="$2" dir old_dirs
+  [[ -d "$root" ]] || return 0
+  old_dirs="$(mktemp)"
+  find "$root" -depth -mindepth 1 -type d -mtime "+${age_days}" -print >"$old_dirs" 2>/dev/null || true
+  find "$root" -mindepth 1 -mtime "+${age_days}" \( -type f -o -type l \) -delete 2>/dev/null || true
+  while IFS= read -r dir; do
+    [[ -d "$dir" ]] || continue
+    rmdir -- "$dir" 2>/dev/null || true
+  done <"$old_dirs"
+  rm -f -- "$old_dirs"
+}
+
+# Drop downloaded action and runner-tool versions that have not been used for
+# a while. The newest version of each package is always kept.
+clean_cache_versions() {
+  local base="$1" age_days="$2" pkg dir newest
+  [[ -d "$base" ]] || return 0
+  while IFS= read -r -d '' pkg; do
+    local -a versions=()
+    while IFS= read -r -d '' dir; do
+      versions+=("$dir")
+    done < <(find "$pkg" -mindepth 1 -maxdepth 1 -type d -print0)
+    ((${#versions[@]} > 0)) || continue
+    newest="${versions[0]}"
+    for dir in "${versions[@]}"; do
+      if [[ "$dir" -nt "$newest" ]]; then
+        newest="$dir"
+      fi
+    done
+    for dir in "${versions[@]}"; do
+      if [[ "$dir" != "$newest" ]] && workspace_is_stale "$dir" "$age_days"; then
+        rm -rf -- "$dir"
+      fi
+    done
+  done < <(find "$base" -depth -mindepth 1 -type d -print0)
+}
+
+# Remove stale job workspaces but preserve downloaded actions and tools.
+# GitHub runners work in /opt/actions-runner/_work, Forgejo runners in
+# /home/runner/work.
+for root in /opt/actions-runner/_work /home/runner/work; do
+  clean_workspaces "$root" 1
+  clean_temp "${root}/_temp" 1
+  clean_cache_versions "${root}/_actions" 30
+  clean_cache_versions "${root}/_tool" 30
+done
+
+# Runner diagnostic logs are never pruned by the runner itself.
+if [[ -d /opt/actions-runner/_diag ]]; then
+  find /opt/actions-runner/_diag -mindepth 1 -maxdepth 1 -type f -mtime +7 -delete
+  find /opt/actions-runner/_diag -mindepth 1 -maxdepth 1 -type d -empty -delete
 fi
+
 if command -v go >/dev/null 2>&1; then
   runuser -u runner -- go clean -cache -testcache || true
 fi
