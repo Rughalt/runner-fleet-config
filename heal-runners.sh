@@ -362,7 +362,11 @@ dbg() { ((VERBOSE == 0)) || note "$*"; return 0; }
 
 discover_runner_vms() { # prints "name<TAB>provider" for every discovered runner VM
   local inst role provider
-  while IFS= read -r inst; do
+  local -a instances=()
+  # Materialize the list first: probing a VM runs incus exec, which consumes
+  # stdin and would silently eat the remaining names from a `while read` pipe.
+  mapfile -t instances < <(incus list --format csv -c n 2>/dev/null || true)
+  for inst in ${instances[@]+"${instances[@]}"}; do
     [[ -n "$inst" ]] || continue
     role="$(runner_role "$inst")"
     dbg "instance '$inst': user.seele.role='${role:-<empty>}'"
@@ -379,7 +383,7 @@ discover_runner_vms() { # prints "name<TAB>provider" for every discovered runner
         [[ -z "$provider" ]] || printf '%s\t%s\n' "$inst" "$provider"
         ;;
     esac
-  done < <(incus list --format csv -c n 2>/dev/null || true)
+  done
 }
 
 wait_for_agent() {
@@ -989,17 +993,23 @@ main() {
     github_org_runners_load || true
     forgejo_scope_runners_load || true
 
-    local found=0 name provider
-    while IFS=$'\t' read -r name provider; do
+    # Materialize discovery before repairing: repair calls incus exec, which
+    # would eat the remaining rows from a `while read` pipe as its stdin.
+    local -a discovered=()
+    mapfile -t discovered < <(discover_runner_vms)
+    local found=0 name provider row
+    for row in ${discovered[@]+"${discovered[@]}"}; do
+      name="${row%%$'\t'*}"
+      provider="${row#*$'\t'}"
       [[ -n "$name" ]] || continue
       [[ -z "$ONLY_VM" || "$name" == "$ONLY_VM" ]] || continue
       found=1
       DISCOVERED_NAMES+=("$name")
       case "$provider" in
-        github) need_github; repair_github_vm "$name" ;;
-        forgejo) need_forgejo; repair_forgejo_vm "$name" ;;
+        github) need_github; repair_github_vm "$name" </dev/null ;;
+        forgejo) need_forgejo; repair_forgejo_vm "$name" </dev/null ;;
       esac
-    done < <(discover_runner_vms)
+    done
 
     if [[ -n "$ONLY_VM" && $found == 0 ]]; then
       die "No runner VM named '$ONLY_VM' was discovered (unmarked stopped VMs need --probe-unmarked)."
