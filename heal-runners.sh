@@ -300,8 +300,9 @@ runner_role() {
 }
 
 remote_name_provider() { # $1=name -> prints github|forgejo when a remote registration matches
-  github_runner_name_known "$1" && { printf 'github\n'; return; }
-  forgejo_runner_name_known "$1" && { printf 'forgejo\n'; return; }
+  github_runner_name_known "$1" && { printf 'github\n'; return 0; }
+  forgejo_runner_name_known "$1" && { printf 'forgejo\n'; return 0; }
+  return 0
 }
 
 probe_vm_provider() { # $1=vm -> prints github|forgejo|container based on installed software
@@ -332,8 +333,8 @@ classify_unmarked_vm() { # $1=vm -> prints github|forgejo or nothing
   [[ -z "$provider" ]] || { printf '%s\n' "$provider"; return; }
   state="$(incus list "$vm" --format csv -c s 2>/dev/null | head -n1)"
   if [[ "$state" != RUNNING ]]; then
-    if ! incus config show "$vm" 2>/dev/null | grep -q 'user\.seele\.' \
-      && ((PROBE_UNMARKED == 0)); then
+    # Never boot an instance just to inspect it without an explicit opt-in.
+    if ((PROBE_UNMARKED == 0)); then
       note "Skipping unmarked stopped VM '$vm' (use --probe-unmarked to start and inspect it)."
       return
     fi
@@ -362,13 +363,14 @@ discover_runner_vms() { # prints "name<TAB>provider" for every discovered runner
     case "$role" in
       runner-v1|github-runner-v1) printf '%s\tgithub\n' "$inst" ;;
       forgejo-runner-v1) printf '%s\tforgejo\n' "$inst" ;;
-      "")
-        # Truly unmarked instances (no user.seele.role at all) may be legacy
-        # runner VMs; classify them conservatively.
-        provider="$(classify_unmarked_vm "$inst")"
+      base-v1) : ;; # golden image, never a runner
+      *)
+        # Unmarked or legacy role values (older provisioners used different
+        # strings): classify by remote record and software probe instead.
+        # || provider="" keeps a classifier bug from silently ending discovery.
+        provider="$(classify_unmarked_vm "$inst")" || provider=""
         [[ -z "$provider" ]] || printf '%s\t%s\n' "$inst" "$provider"
         ;;
-      *) : ;; # base-v1 and any other known role: not a runner
     esac
   done < <(incus list --format csv -c n 2>/dev/null || true)
 }
