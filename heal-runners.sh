@@ -304,14 +304,22 @@ remote_name_provider() { # $1=name -> prints github|forgejo when a remote regist
   forgejo_runner_name_known "$1" && { printf 'forgejo\n'; return; }
 }
 
-probe_vm_provider() { # $1=vm -> prints github|forgejo based on installed software
+probe_vm_provider() { # $1=vm -> prints github|forgejo|container based on installed software
   incus exec "$1" -- sh -c '
-    if test -d /opt/actions-runner; then
+    if test -d /opt/actions-runner \
+      || test -d /root/actions-runner \
+      || ls -d /home/*/actions-runner >/dev/null 2>&1 \
+      || ls /etc/systemd/system/actions.runner.*.service >/dev/null 2>&1 \
+      || pgrep -f "bin/Runner.Listener" >/dev/null 2>&1; then
       printf github
     elif test -x /usr/local/bin/forgejo-runner \
       || test -e /home/runner/runner-config.yml \
-      || test -e /etc/systemd/system/forgejo-runner.service; then
+      || test -e /etc/systemd/system/forgejo-runner.service \
+      || pgrep -f "forgejo-runner" >/dev/null 2>&1; then
       printf forgejo
+    elif command -v docker >/dev/null 2>&1 \
+      && docker ps --format "{{.Names}} {{.Image}}" 2>/dev/null | grep -qi runner; then
+      printf container
     fi' 2>/dev/null || true
 }
 
@@ -334,8 +342,16 @@ classify_unmarked_vm() { # $1=vm -> prints github|forgejo or nothing
       ((rc == 2)) || warn "Could not start '$vm' to inspect it for runner software."
       return
     fi
+  elif ! incus exec "$vm" -- true >/dev/null 2>&1; then
+    note "Unmarked running VM '$vm' has no reachable Incus agent; cannot inspect or heal it."
+    return
   fi
-  probe_vm_provider "$vm"
+  provider="$(probe_vm_provider "$vm")"
+  case "$provider" in
+    "") note "Unmarked VM '$vm' shows no recognized runner software; skipping." ;;
+    container) note "Unmarked VM '$vm' appears to run a runner inside a container; heal it manually."; return ;;
+    *) printf '%s\n' "$provider" ;;
+  esac
 }
 
 discover_runner_vms() { # prints "name<TAB>provider" for every discovered runner VM
@@ -388,32 +404,56 @@ ensure_vm_running() {
   wait_for_agent "$vm"
 }
 
-vm_has_github_config() {
-  incus exec "$1" -- sh -c \
-    'test -e /opt/actions-runner/.runner || test -e /opt/actions-runner/.runner_migrated' \
-    2>/dev/null
+github_runner_dir_vm() { # $1=vm -> runner install dir or empty
+  local vm="$1"
+  if incus exec "$vm" -- test -d /opt/actions-runner 2>/dev/null; then
+    printf '/opt/actions-runner\n'; return
+  fi
+  # Older installs live elsewhere; the svc.sh unit records the location.
+  incus exec "$vm" -- sh -c '
+    for u in /etc/systemd/system/actions.runner.*.service; do
+      test -e "$u" || continue
+      sed -n "s/^WorkingDirectory=//p" "$u" | head -n1
+      exit
+    done' 2>/dev/null || true
 }
 
-vm_github_runner_field() { # $1=vm $2=jq filter on .runner or .runner_migrated
-  incus exec "$1" -- sh -c \
-    "jq -r '$2' /opt/actions-runner/.runner 2>/dev/null \
-      || jq -r '$2' /opt/actions-runner/.runner_migrated" 2>/dev/null || true
+github_runner_user_vm() { # $1=vm -> service user from the unit, default runner
+  local user
+  user="$(incus exec "$1" -- sh -c '
+    for u in /etc/systemd/system/actions.runner.*.service; do
+      test -e "$u" || continue
+      sed -n "s/^User=//p" "$u" | head -n1
+      exit
+    done' 2>/dev/null || true)"
+  printf '%s\n' "${user:-runner}"
 }
 
-vm_ensure_github_service() { # $1=vm; repair + start svc.sh service; returns 0 ok
-  local vm="$1" service
-  if ! incus exec "$vm" -- test -s /opt/actions-runner/.service; then
-    incus exec "$vm" -- bash -c 'cd /opt/actions-runner && ./svc.sh install runner' >/dev/null \
+vm_has_github_config() { # $1=vm $2=dir
+  incus exec "$1" -- sh -c \
+    "test -e '$2/.runner' || test -e '$2/.runner_migrated'" 2>/dev/null
+}
+
+vm_github_runner_field() { # $1=vm $2=dir $3=jq filter on .runner or .runner_migrated
+  incus exec "$1" -- sh -c \
+    "jq -r '$3' '$2/.runner' 2>/dev/null || jq -r '$3' '$2/.runner_migrated'" \
+    2>/dev/null || true
+}
+
+vm_ensure_github_service() { # $1=vm $2=dir $3=user; repair + start svc.sh service
+  local vm="$1" dir="$2" user="$3" service
+  if ! incus exec "$vm" -- test -s "$dir/.service"; then
+    incus exec "$vm" -- bash -c "cd '$dir' && ./svc.sh install '$user'" >/dev/null \
       || return 1
   fi
-  service="$(incus exec "$vm" -- sh -c 'cat /opt/actions-runner/.service 2>/dev/null' || true)"
+  service="$(incus exec "$vm" -- sh -c "cat '$dir/.service' 2>/dev/null" || true)"
   [[ -n "$service" ]] || return 1
   incus exec "$vm" -- systemctl enable --now "$service" >/dev/null 2>&1 || true
   incus exec "$vm" -- systemctl is-active --quiet "$service"
 }
 
-vm_github_reregister() { # $1=vm $2=org $3=group $4=labels $5=replace(0|1)
-  local vm="$1" org="$2" group="$3" labels="$4" replace="$5" token
+vm_github_reregister() { # $1=vm $2=dir $3=user $4=org $5=group $6=labels $7=replace(0|1)
+  local vm="$1" dir="$2" user="$3" org="$4" group="$5" labels="$6" replace="$7" token
   token="$(github_registration_token)"
   printf '%s' "$token" >"$TEMP_DIR/registration-token"
   chmod 600 "$TEMP_DIR/registration-token"
@@ -423,8 +463,8 @@ vm_github_reregister() { # $1=vm $2=org $3=group $4=labels $5=replace(0|1)
   cat >"$TEMP_DIR/reregister.sh" <<'GUEST'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-ORG="$1" GROUP="$2" NAME="$3" LABELS="$4" REPLACE="$5"
-cd /opt/actions-runner
+DIR="$1" ORG="$2" GROUP="$3" NAME="$4" LABELS="$5" REPLACE="$6" SVC_USER="$7"
+cd "$DIR"
 if [[ -s .service ]]; then
   systemctl disable --now "$(cat .service)" 2>/dev/null || true
 fi
@@ -436,13 +476,13 @@ rm -f /run/github-runner-registration-token
 args=(--unattended --url "https://github.com/$ORG" --token "$token" --name "$NAME" \
       --runnergroup "$GROUP" --work _work --labels "$LABELS")
 [[ "$REPLACE" != 1 ]] || args+=(--replace)
-runuser -u runner -- ./config.sh "${args[@]}"
-./svc.sh install runner
+runuser -u "$SVC_USER" -- ./config.sh "${args[@]}"
+./svc.sh install "$SVC_USER"
 ./svc.sh start
 systemctl is-active --quiet "$(cat .service)"
 GUEST
   incus file push "$TEMP_DIR/reregister.sh" "$vm/root/reregister.sh"
-  if ! incus exec "$vm" -- bash /root/reregister.sh "$org" "$group" "$vm" "$labels" "$replace"; then
+  if ! incus exec "$vm" -- bash /root/reregister.sh "$dir" "$org" "$group" "$vm" "$labels" "$replace" "$user"; then
     incus exec "$vm" -- rm -f /root/reregister.sh /run/github-runner-registration-token || true
     return 1
   fi
@@ -451,7 +491,7 @@ GUEST
 
 # Repair one GitHub Incus runner VM. Appends to FAILURES on unrecoverable error.
 repair_github_vm() {
-  local vm="$1" record status local_cfg org group labels replace rc
+  local vm="$1" record status local_cfg org group labels replace rc dir user
   log "🐗 Checking GitHub runner VM '$vm'"
   ensure_vm_running "$vm" && rc=0 || rc=$?
   case "$rc" in
@@ -460,13 +500,19 @@ repair_github_vm() {
     *) FAILURES+=("$vm: VM cannot be reached"); return ;;
   esac
 
-  local_cfg=0; vm_has_github_config "$vm" && local_cfg=1
-  if ! incus exec "$vm" -- test -x /opt/actions-runner/config.sh; then
+  dir="$(github_runner_dir_vm "$vm")"
+  if [[ -z "$dir" ]]; then
+    note "$vm has no runner software; run provision-seele-runners.sh for a full install."
+    return
+  fi
+  user="$(github_runner_user_vm "$vm")"
+  local_cfg=0; vm_has_github_config "$vm" "$dir" && local_cfg=1
+  if ! incus exec "$vm" -- test -x "$dir/config.sh"; then
     if ((local_cfg == 1)); then
-      warn "$vm has credentials but no runner software; wipe it with the provisioner --cleanup or reinstall."
-      FAILURES+=("$vm: runner software missing")
+      warn "$vm has credentials but no runnable config.sh in $dir; inspect the install manually."
+      FAILURES+=("$vm: runner software incomplete")
     else
-      note "$vm has no runner software; run provision-seele-runners.sh for a full install."
+      note "$vm has a runner service unit but no runnable software; run provision-seele-runners.sh for a full install."
     fi
     return
   fi
@@ -477,7 +523,7 @@ repair_github_vm() {
 
   if ((local_cfg == 1)) && [[ -n "$record" ]]; then
     if plan "would ensure the runner service in '$vm' is enabled and running."; then return; fi
-    if vm_ensure_github_service "$vm"; then
+    if vm_ensure_github_service "$vm" "$dir" "$user"; then
       note "$vm is registered ($status) and its service is active."
     else
       warn "$vm is registered but its service could not be started."
@@ -489,8 +535,8 @@ repair_github_vm() {
   org="$ORG"; group="$RUNNER_GROUP"
   if ((local_cfg == 1)); then
     local stale_url stale_group
-    stale_url="$(vm_github_runner_field "$vm" '.gitHubUrl // empty')"
-    stale_group="$(vm_github_runner_field "$vm" '.poolName // empty')"
+    stale_url="$(vm_github_runner_field "$vm" "$dir" '.gitHubUrl // empty')"
+    stale_group="$(vm_github_runner_field "$vm" "$dir" '.poolName // empty')"
     [[ -z "$stale_url" ]] || org="${stale_url##*/}"
     [[ -z "$stale_group" ]] || group="$stale_group"
     [[ "$org" == "$ORG" ]] || warn "$vm was registered under org '$org', which differs from ORG=$ORG."
@@ -537,7 +583,7 @@ repair_github_vm() {
     esac
   fi
 
-  if vm_github_reregister "$vm" "$org" "$group" "$labels" "$replace"; then
+  if vm_github_reregister "$vm" "$dir" "$user" "$org" "$group" "$labels" "$replace"; then
     GH_RUNNERS_JSON=""
     log "✅ $vm re-registered in $org / $group and its service is active."
   else
