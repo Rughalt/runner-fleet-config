@@ -69,15 +69,20 @@ ONLY_VM=""
 DO_INCUS=1
 DO_LOCAL=1
 INCUS_REQUESTED=0
+PROBE_UNMARKED=0
 declare -a FAILURES=()
 GH_CHECKED=0
 FJ_CHECKED=0
+GH_RUNNERS_JSON=""
+FJ_RUNNERS_JSON=""
 TEMP_DIR=""
 
-log()  { printf '\n🩹 [%s] %s\n' "$(date '+%F %T')" "$*"; }
+# All human-facing output goes to stderr: several helpers are used inside
+# command substitutions whose stdout must carry only machine-readable data.
+log()  { printf '\n🩹 [%s] %s\n' "$(date '+%F %T')" "$*" >&2; }
 warn() { printf '\n⚠️  WARNING: %s\n' "$*" >&2; }
 die()  { printf '\n❌ ERROR: %s\n' "$*" >&2; exit 1; }
-note() { printf '    %s\n' "$*"; }
+note() { printf '    %s\n' "$*" >&2; }
 
 cleanup() {
   [[ -z "${TEMP_DIR:-}" || ! -d "$TEMP_DIR" ]] || rm -rf -- "$TEMP_DIR"
@@ -88,21 +93,29 @@ trap 'die "Command failed at line $LINENO: $BASH_COMMAND"' ERR
 usage() {
   cat <<'EOF'
 Usage:
-  sudo ./reregister-runners.sh --dry-run
-  sudo ./reregister-runners.sh
-  sudo ./reregister-runners.sh --vm selee-trotter-01
-  sudo ./reregister-runners.sh --local
-  sudo ./reregister-runners.sh --replace-remote
+  sudo ./heal-runners.sh --dry-run
+  sudo ./heal-runners.sh
+  sudo ./heal-runners.sh --vm selee-trotter-01
+  sudo ./heal-runners.sh --local
+  sudo ./heal-runners.sh --replace-remote
 
 Options:
   --dry-run         Report local/remote registration state; change nothing.
-  --vm NAME         Repair only this provisioner-owned runner VM.
+  --vm NAME         Repair only this runner VM.
   --incus           Repair Incus runner VMs only.
   --local|--potato  Repair the managed direct (potato) runner only.
   --replace-remote  Also replace a remote registration that still exists while
                     local credentials are gone. Without it such a runner is
                     reported and skipped instead of deleted remotely.
+  --probe-unmarked  Also start stopped VMs that carry no provisioner markers so
+                    they can be probed for runner software. Without it they are
+                    listed and left alone.
   --help            Show this help.
+
+Runner VMs are discovered through their user.seele.role marker, through any
+other user.seele.* marker, through a remote registration matching the VM name,
+or by probing the VM for runner software. Runners living in a different Incus
+project are not seen; run 'incus project switch NAME' first.
 
 Reconciliation per runner:
   local credentials + remote present   -> ensure the service runs; nothing else.
@@ -124,6 +137,7 @@ while (($#)); do
     --dry-run) DRY_RUN=1; shift ;;
     --replace-remote) REPLACE_REMOTE=1; shift ;;
     --incus) DO_LOCAL=0; INCUS_REQUESTED=1; shift ;;
+    --probe-unmarked) PROBE_UNMARKED=1; shift ;;
     --local|--potato) DO_INCUS=0; shift ;;
     --vm)
       (($# >= 2)) || die "--vm requires an instance name."
@@ -164,16 +178,32 @@ need_github() {
   GH_CHECKED=1
 }
 
-github_runner_record() { # $1=name -> full runner JSON or empty
-  local name="$1" page=1 response record total
+# Full org runner list, fetched once and reused for every lookup. Fails softly
+# so discovery can skip remote matching when no usable token is around.
+github_org_runners_load() { # fills GH_RUNNERS_JSON; call directly, not in $()
+  [[ -n "$GH_RUNNERS_JSON" ]] && return 0
+  [[ -n "${GH_TOKEN:-}" ]] || return 1
+  local page=1 response collected='[]' total
   while :; do
-    response="$(github_api GET "/orgs/$ORG/actions/runners?per_page=100&page=$page")"
-    record="$(jq -c --arg n "$name" '.runners[] | select(.name == $n)' <<<"$response" | head -n1)"
-    [[ -z "$record" ]] || { printf '%s\n' "$record"; return 0; }
-    total="$(jq -r '.total_count' <<<"$response")"
+    response="$(github_api GET "/orgs/$ORG/actions/runners?per_page=100&page=$page")" || return 1
+    total="$(jq -r '.total_count' <<<"$response")" || return 1
+    collected="$(jq -cn --argjson a "$collected" --argjson b "$(jq -c '.runners' <<<"$response")" '$a + $b')"
     ((page * 100 >= total)) && break
     ((page++))
   done
+  GH_RUNNERS_JSON="$collected"
+}
+
+github_org_runners() {
+  github_org_runners_load && printf '%s\n' "$GH_RUNNERS_JSON"
+}
+
+github_runner_record() { # $1=name -> full runner JSON or empty; fatal on API failure
+  github_org_runners | jq -c --arg n "$1" '.[] | select(.name == $n)' | head -n1
+}
+
+github_runner_name_known() { # $1=name -> soft remote match for discovery
+  github_org_runners 2>/dev/null | jq -e --arg n "$1" 'any(.[]; .name == $n)' >/dev/null 2>&1
 }
 
 github_registration_token() {
@@ -182,6 +212,7 @@ github_registration_token() {
 
 github_delete_runner() {
   github_api DELETE "/orgs/$ORG/actions/runners/$1" >/dev/null
+  GH_RUNNERS_JSON=""
 }
 
 # Custom labels only: GitHub auto-adds self-hosted, the OS and the arch.
@@ -228,9 +259,23 @@ need_forgejo() {
   FJ_CHECKED=1
 }
 
-forgejo_runner_record() { # $1=name -> full runner JSON or empty
-  forgejo_api GET "$(forgejo_runner_endpoint)" \
-    | jq -c --arg n "$1" '(.runners? // . // [])[] | select(.name == $n)' | head -n1
+forgejo_scope_runners_load() { # fills FJ_RUNNERS_JSON; call directly, not in $()
+  [[ -n "$FJ_RUNNERS_JSON" ]] && return 0
+  [[ -n "$FORGEJO_URL" && -n "$FORGEJO_API_TOKEN" ]] || return 1
+  FJ_RUNNERS_JSON="$(forgejo_api GET "$(forgejo_runner_endpoint)" \
+    | jq -c '(.runners? // . // [])')"
+}
+
+forgejo_scope_runners() {
+  forgejo_scope_runners_load && printf '%s\n' "$FJ_RUNNERS_JSON"
+}
+
+forgejo_runner_record() { # $1=name -> full runner JSON or empty; fatal on API failure
+  forgejo_scope_runners | jq -c --arg n "$1" '.[] | select(.name == $n)' | head -n1
+}
+
+forgejo_runner_name_known() { # $1=name -> soft remote match for discovery
+  forgejo_scope_runners 2>/dev/null | jq -e --arg n "$1" 'any(.[]; .name == $n)' >/dev/null 2>&1
 }
 
 forgejo_new_identity() { # $1=name, $2=description -> {uuid, token, id}
@@ -253,13 +298,60 @@ runner_role() {
   incus config get "$1" user.seele.role 2>/dev/null || true
 }
 
-discover_runner_vms() { # prints "name<TAB>role" for owned runner VMs
-  local inst role
+remote_name_provider() { # $1=name -> prints github|forgejo when a remote registration matches
+  github_runner_name_known "$1" && { printf 'github\n'; return; }
+  forgejo_runner_name_known "$1" && { printf 'forgejo\n'; return; }
+}
+
+probe_vm_provider() { # $1=vm -> prints github|forgejo based on installed software
+  incus exec "$1" -- sh -c '
+    if test -d /opt/actions-runner; then
+      printf github
+    elif test -x /usr/local/bin/forgejo-runner \
+      || test -e /home/runner/runner-config.yml \
+      || test -e /etc/systemd/system/forgejo-runner.service; then
+      printf forgejo
+    fi' 2>/dev/null || true
+}
+
+# An instance without a user.seele.role marker is still a runner candidate when
+# a remote registration carries its name, when it is running runner software,
+# or when it carries any other user.seele.* marker (partial/legacy provisioning).
+classify_unmarked_vm() { # $1=vm -> prints github|forgejo or nothing
+  local vm="$1" provider state rc
+  provider="$(remote_name_provider "$vm")"
+  [[ -z "$provider" ]] || { printf '%s\n' "$provider"; return; }
+  state="$(incus list "$vm" --format csv -c s 2>/dev/null | head -n1)"
+  if [[ "$state" != RUNNING ]]; then
+    if ! incus config show "$vm" 2>/dev/null | grep -q 'user\.seele\.' \
+      && ((PROBE_UNMARKED == 0)); then
+      note "Skipping unmarked stopped VM '$vm' (use --probe-unmarked to start and inspect it)."
+      return
+    fi
+    ensure_vm_running "$vm" && rc=0 || rc=$?
+    if ((rc != 0)); then
+      ((rc == 2)) || warn "Could not start '$vm' to inspect it for runner software."
+      return
+    fi
+  fi
+  probe_vm_provider "$vm"
+}
+
+discover_runner_vms() { # prints "name<TAB>provider" for every discovered runner VM
+  local inst role provider
   while IFS= read -r inst; do
     [[ -n "$inst" ]] || continue
     role="$(runner_role "$inst")"
     case "$role" in
-      runner-v1|github-runner-v1|forgejo-runner-v1) printf '%s\t%s\n' "$inst" "$role" ;;
+      runner-v1|github-runner-v1) printf '%s\tgithub\n' "$inst" ;;
+      forgejo-runner-v1) printf '%s\tforgejo\n' "$inst" ;;
+      "")
+        # Truly unmarked instances (no user.seele.role at all) may be legacy
+        # runner VMs; classify them conservatively.
+        provider="$(classify_unmarked_vm "$inst")"
+        [[ -z "$provider" ]] || printf '%s\t%s\n' "$inst" "$provider"
+        ;;
+      *) : ;; # base-v1 and any other known role: not a runner
     esac
   done < <(incus list --format csv -c n 2>/dev/null || true)
 }
@@ -444,6 +536,7 @@ repair_github_vm() {
   fi
 
   if vm_github_reregister "$vm" "$org" "$group" "$labels" "$replace"; then
+    GH_RUNNERS_JSON=""
     log "✅ $vm re-registered in $org / $group and its service is active."
   else
     warn "$vm re-registration failed; the VM was kept for inspection."
@@ -505,6 +598,7 @@ repair_forgejo_vm() {
         FAILURES+=("$vm: remote delete failed")
         return
       fi
+      FJ_RUNNERS_JSON=""
       note "Deleted stale remote Forgejo runner '$vm' (id $id)."
       record=""
     else
@@ -519,12 +613,13 @@ repair_forgejo_vm() {
   [[ -n "$labels" ]] || labels="$FORGEJO_LABELS"
 
   if plan "would create a fresh Forgejo identity for '$vm' (labels: $labels) and rewrite runner-config.yml."; then return; fi
-  if ! identity="$(forgejo_new_identity "$vm" "Incus VM re-registered by reregister-runners.sh")"; then
+  if ! identity="$(forgejo_new_identity "$vm" "Incus VM re-registered by heal-runners.sh")"; then
     warn "Forgejo refused a new identity for '$vm'."
     FAILURES+=("$vm: Forgejo identity creation failed")
     return
   fi
   uuid="$(jq -er '.uuid' <<<"$identity")"; token="$(jq -er '.token' <<<"$identity")"
+  FJ_RUNNERS_JSON=""
   forgejo_runner_config "$uuid" "$token" "$labels" >"$TEMP_DIR/forgejo-runner-config.json"
   chmod 600 "$TEMP_DIR/forgejo-runner-config.json"
   incus file push "$TEMP_DIR/forgejo-runner-config.json" "$vm/run/forgejo-runner-config.json"
@@ -665,6 +760,7 @@ repair_potato() {
     fi
     service="$(cat "$POTATO_GITHUB_DIR/.service")"
     if systemctl is-active --quiet "$service"; then
+      GH_RUNNERS_JSON=""
       log "✅ $name re-registered in $org / $group and $service is active."
     else
       warn "$name re-registered but $service did not become active."
@@ -717,6 +813,7 @@ repair_potato() {
         FAILURES+=("$name: remote delete failed")
         return
       fi
+      FJ_RUNNERS_JSON=""
       note "Deleted stale remote Forgejo runner '$name' (id $id)."
       record=""
     else
@@ -731,12 +828,13 @@ repair_potato() {
   if plan "would create a fresh Forgejo identity for '$name' (labels: $labels) and rewrite $POTATO_FORGEJO_CONFIG."; then return; fi
 
   local identity uuid token runner_group
-  if ! identity="$(forgejo_new_identity "$name" "Direct Ubuntu host re-registered by reregister-runners.sh")"; then
+  if ! identity="$(forgejo_new_identity "$name" "Direct Ubuntu host re-registered by heal-runners.sh")"; then
     warn "Forgejo refused a new identity for '$name'."
     FAILURES+=("$name: Forgejo identity creation failed")
     return
   fi
   uuid="$(jq -er '.uuid' <<<"$identity")"; token="$(jq -er '.token' <<<"$identity")"
+  FJ_RUNNERS_JSON=""
   runner_group="$(id -gn "$user")"
   forgejo_runner_config "$uuid" "$token" "$labels" >"$POTATO_FORGEJO_CONFIG"
   chmod 0640 "$POTATO_FORGEJO_CONFIG"; chown root:"$runner_group" "$POTATO_FORGEJO_CONFIG"
@@ -799,19 +897,24 @@ main() {
     exec 9>/run/lock/seele-runners.lock
     flock -n 9 || die "The runner provisioner or another maintenance run is active. Stop it or wait for it to finish."
 
-    local found=0 name role
-    while IFS=$'\t' read -r name role; do
+    # Warm the remote runner lists once (best effort): the discovery loop runs
+    # in a subshell that inherits these caches, so each list is fetched once.
+    github_org_runners_load || true
+    forgejo_scope_runners_load || true
+
+    local found=0 name provider
+    while IFS=$'\t' read -r name provider; do
       [[ -n "$name" ]] || continue
       [[ -z "$ONLY_VM" || "$name" == "$ONLY_VM" ]] || continue
       found=1
-      case "$role" in
-        runner-v1|github-runner-v1) need_github; repair_github_vm "$name" ;;
-        forgejo-runner-v1) need_forgejo; repair_forgejo_vm "$name" ;;
+      case "$provider" in
+        github) need_github; repair_github_vm "$name" ;;
+        forgejo) need_forgejo; repair_forgejo_vm "$name" ;;
       esac
     done < <(discover_runner_vms)
 
     if [[ -n "$ONLY_VM" && $found == 0 ]]; then
-      die "No provisioner-owned runner VM named '$ONLY_VM'."
+      die "No runner VM named '$ONLY_VM' was discovered (unmarked stopped VMs need --probe-unmarked)."
     elif ((found == 0)); then
       note "No provisioner-owned runner VMs found."
     fi

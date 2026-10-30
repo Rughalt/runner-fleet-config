@@ -610,7 +610,7 @@ unmarked legacy VM or profile with a conflicting name is never adopted or change
 the run stops and asks you to rename it. An incompatible legacy pool called
 `seele-cow` is left alone and the new pool receives the next free suffix.
 
-## Re-registering lost runners
+## Healing lost runners
 
 GitHub automatically deletes a self-hosted runner registration after it has not
 connected for more than 14 days. A Trotter that stayed stopped, errored, or
@@ -619,16 +619,23 @@ still carries stale credentials in `/opt/actions-runner/.runner`. The
 provisioner deliberately refuses that state ("configured locally but missing
 from GitHub"), so a lost registration used to require manual reconciliation.
 
-`reregister-runners.sh` reconciles every provisioner-owned runner — GitHub and
-Forgejo Incus VMs plus the managed potato runner — against the remote
-registrations and repairs only what diverged:
+`heal-runners.sh` reconciles every runner on the host — GitHub and Forgejo
+Incus VMs plus the managed potato runner — against the remote registrations and
+repairs only what diverged:
 
 ```bash
-sudo ./reregister-runners.sh --dry-run
-sudo ./reregister-runners.sh
-sudo ./reregister-runners.sh --vm selee-trotter-01
-sudo ./reregister-runners.sh --local
+sudo ./heal-runners.sh --dry-run
+sudo ./heal-runners.sh
+sudo ./heal-runners.sh --vm selee-trotter-01
+sudo ./heal-runners.sh --local
 ```
+
+A VM counts as a runner when its `user.seele.role` marker says so, when any
+other `user.seele.*` marker is present (older or partial provisioning), when a
+remote registration carries its name, or when a probe finds runner software
+inside it. A stopped VM without any markers is listed and left alone unless
+`--probe-unmarked` allows starting it for inspection. Instances in a different
+Incus project are not seen; switch the project first.
 
 For each runner it compares the local credentials with the remote record:
 
@@ -654,7 +661,7 @@ name belongs to another installation. After verifying the remote entry is
 stale, opt in explicitly:
 
 ```bash
-sudo ./reregister-runners.sh --replace-remote
+sudo ./heal-runners.sh --replace-remote
 ```
 
 `REPLACE_OFFLINE_RUNNER=1` in `.env` is equivalent. The script holds the same
