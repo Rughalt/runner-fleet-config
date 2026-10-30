@@ -70,6 +70,7 @@ DO_INCUS=1
 DO_LOCAL=1
 INCUS_REQUESTED=0
 PROBE_UNMARKED=0
+VERBOSE=0
 declare -a FAILURES=()
 declare -a DISCOVERED_NAMES=()
 GH_CHECKED=0
@@ -111,6 +112,7 @@ Options:
   --probe-unmarked  Also start stopped VMs that carry no provisioner markers so
                     they can be probed for runner software. Without it they are
                     listed and left alone.
+  -v, --verbose     Show discovery details for every instance (role, verdict).
   --help            Show this help.
 
 Runner VMs are discovered through their user.seele.role marker, through any
@@ -139,6 +141,7 @@ while (($#)); do
     --replace-remote) REPLACE_REMOTE=1; shift ;;
     --incus) DO_LOCAL=0; INCUS_REQUESTED=1; shift ;;
     --probe-unmarked) PROBE_UNMARKED=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
     --local|--potato) DO_INCUS=0; shift ;;
     --vm)
       (($# >= 2)) || die "--vm requires an instance name."
@@ -355,11 +358,14 @@ classify_unmarked_vm() { # $1=vm -> prints github|forgejo or nothing
   esac
 }
 
+dbg() { ((VERBOSE == 0)) || note "$*"; return 0; }
+
 discover_runner_vms() { # prints "name<TAB>provider" for every discovered runner VM
   local inst role provider
   while IFS= read -r inst; do
     [[ -n "$inst" ]] || continue
     role="$(runner_role "$inst")"
+    dbg "instance '$inst': user.seele.role='${role:-<empty>}'"
     case "$role" in
       runner-v1|github-runner-v1) printf '%s\tgithub\n' "$inst" ;;
       forgejo-runner-v1) printf '%s\tforgejo\n' "$inst" ;;
@@ -369,6 +375,7 @@ discover_runner_vms() { # prints "name<TAB>provider" for every discovered runner
         # strings): classify by remote record and software probe instead.
         # || provider="" keeps a classifier bug from silently ending discovery.
         provider="$(classify_unmarked_vm "$inst")" || provider=""
+        dbg "instance '$inst': classification='${provider:-<none>}'"
         [[ -z "$provider" ]] || printf '%s\t%s\n' "$inst" "$provider"
         ;;
     esac
@@ -997,7 +1004,9 @@ main() {
     if [[ -n "$ONLY_VM" && $found == 0 ]]; then
       die "No runner VM named '$ONLY_VM' was discovered (unmarked stopped VMs need --probe-unmarked)."
     elif ((found == 0)); then
-      note "No provisioner-owned runner VMs found."
+      note "No runner VMs discovered."
+    else
+      note "Discovered $found runner VM(s)."
     fi
   fi
 
