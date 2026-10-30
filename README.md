@@ -610,6 +610,59 @@ unmarked legacy VM or profile with a conflicting name is never adopted or change
 the run stops and asks you to rename it. An incompatible legacy pool called
 `seele-cow` is left alone and the new pool receives the next free suffix.
 
+## Re-registering lost runners
+
+GitHub automatically deletes a self-hosted runner registration after it has not
+connected for more than 14 days. A Trotter that stayed stopped, errored, or
+disk-full for two weeks is therefore gone from the organization while its VM
+still carries stale credentials in `/opt/actions-runner/.runner`. The
+provisioner deliberately refuses that state ("configured locally but missing
+from GitHub"), so a lost registration used to require manual reconciliation.
+
+`reregister-runners.sh` reconciles every provisioner-owned runner — GitHub and
+Forgejo Incus VMs plus the managed potato runner — against the remote
+registrations and repairs only what diverged:
+
+```bash
+sudo ./reregister-runners.sh --dry-run
+sudo ./reregister-runners.sh
+sudo ./reregister-runners.sh --vm selee-trotter-01
+sudo ./reregister-runners.sh --local
+```
+
+For each runner it compares the local credentials with the remote record:
+
+| Local credentials | Remote registration | Action |
+|---|---|---|
+| present | present | ensure the service is enabled and running; nothing else |
+| present | absent | wipe the stale `.runner`/`.credentials*`, re-register fresh |
+| absent | offline | re-register over the stale entry with `--replace` |
+| absent | absent | fresh registration |
+| absent | present | reported and skipped (see below) |
+
+Re-registration preserves the runner's identity: the org and runner group are
+read back from the stale `.runner` or the potato state file, and labels are
+copied from the surviving remote record. When nothing is left to copy, the
+usual `.env` values apply (`ORG`, `RUNNER_GROUP`, `RUNNER_LABELS` for the
+fleet, `GITHUB_LABELS` for the potato, `FORGEJO_*` for Lux/Poros). Forgejo
+runners get a new remote identity written into their existing
+`runner-config.yml`, keeping their configured labels.
+
+The one case that is never touched implicitly is a remote registration that
+still exists while the machine holds no credentials — that usually means the
+name belongs to another installation. After verifying the remote entry is
+stale, opt in explicitly:
+
+```bash
+sudo ./reregister-runners.sh --replace-remote
+```
+
+`REPLACE_OFFLINE_RUNNER=1` in `.env` is equivalent. The script holds the same
+locks as the provisioners, starts stopped/errored VMs first, needs the matching
+provider token (`GH_TOKEN` or `FORGEJO_URL`/`FORGEJO_API_TOKEN`), and reports a
+per-runner summary instead of stopping at the first failure. Scheduling it from
+cron or a systemd timer makes the 14-day auto-removal self-healing.
+
 ## Workflow
 
 The standard labels are retained, so the requested minimal selector works:
