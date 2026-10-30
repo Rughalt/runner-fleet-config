@@ -71,6 +71,7 @@ DO_LOCAL=1
 INCUS_REQUESTED=0
 PROBE_UNMARKED=0
 declare -a FAILURES=()
+declare -a DISCOVERED_NAMES=()
 GH_CHECKED=0
 FJ_CHECKED=0
 GH_RUNNERS_JSON=""
@@ -882,6 +883,35 @@ EOF
 
 # ------------------------------------------------------------------------ main
 
+# Informational: remote runner registrations that no local runner claims. They
+# may legitimately live on other machines, or their VMs may be gone entirely.
+report_unmatched_remote() {
+  local -A local_names=()
+  local -a unmatched=()
+  local n
+  for n in ${DISCOVERED_NAMES[@]+"${DISCOVERED_NAMES[@]}"}; do
+    local_names["$n"]=1
+  done
+  if [[ -s "$POTATO_STATE" ]]; then
+    n="$(jq -r '.name // empty' "$POTATO_STATE" 2>/dev/null || true)"
+    [[ -z "$n" ]] || local_names["$n"]=1
+  fi
+  if github_org_runners_load 2>/dev/null; then
+    while IFS= read -r n; do
+      [[ -n "$n" && -z "${local_names[$n]:-}" ]] && unmatched+=("$n (github)")
+    done < <(github_org_runners | jq -r '.[].name')
+  fi
+  if forgejo_scope_runners_load 2>/dev/null; then
+    while IFS= read -r n; do
+      [[ -n "$n" && -z "${local_names[$n]:-}" ]] && unmatched+=("$n (forgejo)")
+    done < <(forgejo_scope_runners | jq -r '.[].name')
+  fi
+  ((${#unmatched[@]} == 0)) && return 0
+  log "🌐 Remote registrations not backed by a runner on this host:"
+  printf '    %s\n' "${unmatched[@]}" >&2
+  note "They may belong to other machines, or their VMs may be gone. Recreate missing fleets with the provisioner; delete true orphans on the provider."
+}
+
 main() {
   TEMP_DIR="$(mktemp -d -t runner-reregister.XXXXXXXX)"
   chmod 700 "$TEMP_DIR"
@@ -909,6 +939,7 @@ main() {
       [[ -n "$name" ]] || continue
       [[ -z "$ONLY_VM" || "$name" == "$ONLY_VM" ]] || continue
       found=1
+      DISCOVERED_NAMES+=("$name")
       case "$provider" in
         github) need_github; repair_github_vm "$name" ;;
         forgejo) need_forgejo; repair_forgejo_vm "$name" ;;
@@ -928,6 +959,8 @@ main() {
     flock -n 8 || die "The potato provisioner or another maintenance run is active."
     repair_potato
   fi
+
+  report_unmatched_remote
 
   if ((${#FAILURES[@]} > 0)); then
     warn "Some runners could not be repaired:"

@@ -667,8 +667,11 @@ sudo ./heal-runners.sh --replace-remote
 `REPLACE_OFFLINE_RUNNER=1` in `.env` is equivalent. The script holds the same
 locks as the provisioners, starts stopped/errored VMs first, needs the matching
 provider token (`GH_TOKEN` or `FORGEJO_URL`/`FORGEJO_API_TOKEN`), and reports a
-per-runner summary instead of stopping at the first failure. Scheduling it from
-cron or a systemd timer makes the 14-day auto-removal self-healing.
+per-runner summary instead of stopping at the first failure. It finishes by
+listing remote registrations that no local runner claims — stale orphans of
+deleted VMs or runners living on other machines — so a runner missing from both
+lists has to be recreated with the provisioner. Scheduling it from cron or a
+systemd timer makes the 14-day auto-removal self-healing.
 
 ## Workflow
 
