@@ -635,7 +635,7 @@ For each runner it compares the local credentials with the remote record:
 | Local credentials | Remote registration | Action |
 |---|---|---|
 | present | present | ensure the service is enabled and running; nothing else |
-| present | absent | wipe the stale `.runner`/`.credentials*`, re-register fresh |
+| present | absent | wipe the stale `.runner*`/`.credentials*`, re-register fresh |
 | absent | offline | re-register over the stale entry with `--replace` |
 | absent | absent | fresh registration |
 | absent | present | reported and skipped (see below) |

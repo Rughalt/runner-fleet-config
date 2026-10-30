@@ -296,11 +296,15 @@ ensure_vm_running() {
 }
 
 vm_has_github_config() {
-  incus exec "$1" -- test -e /opt/actions-runner/.runner 2>/dev/null
+  incus exec "$1" -- sh -c \
+    'test -e /opt/actions-runner/.runner || test -e /opt/actions-runner/.runner_migrated' \
+    2>/dev/null
 }
 
-vm_github_runner_field() { # $1=vm $2=jq filter on .runner
-  incus exec "$1" -- sh -c "jq -r '$2' /opt/actions-runner/.runner" 2>/dev/null || true
+vm_github_runner_field() { # $1=vm $2=jq filter on .runner or .runner_migrated
+  incus exec "$1" -- sh -c \
+    "jq -r '$2' /opt/actions-runner/.runner 2>/dev/null \
+      || jq -r '$2' /opt/actions-runner/.runner_migrated" 2>/dev/null || true
 }
 
 vm_ensure_github_service() { # $1=vm; repair + start svc.sh service; returns 0 ok
@@ -332,8 +336,8 @@ if [[ -s .service ]]; then
   systemctl disable --now "$(cat .service)" 2>/dev/null || true
 fi
 ./svc.sh uninstall >/dev/null 2>&1 || true
-rm -f .runner .credentials .credentials_rsaparams .credentials_migrated \
-      .service .svcsh .env .path runsvc.sh
+rm -f .runner .runner_migrated .credentials .credentials_rsaparams \
+      .credentials_migrated .service .svcsh .env .path runsvc.sh
 token="$(</run/github-runner-registration-token)"
 rm -f /run/github-runner-registration-token
 args=(--unattended --url "https://github.com/$ORG" --token "$token" --name "$NAME" \
@@ -565,7 +569,7 @@ repair_potato() {
     log "🥔 Checking potato GitHub runner '$name'"
 
     local local_cfg=0
-    [[ -f "$POTATO_GITHUB_DIR/.runner" ]] && local_cfg=1
+    [[ -f "$POTATO_GITHUB_DIR/.runner" || -f "$POTATO_GITHUB_DIR/.runner_migrated" ]] && local_cfg=1
     if ((local_cfg == 1)) && [[ ! -f "$POTATO_GITHUB_DIR/$MANAGED_MARKER" ]]; then
       warn "$POTATO_GITHUB_DIR contains an unmanaged runner; refusing to adopt it."
       FAILURES+=("$name: unmanaged runner directory")
@@ -641,7 +645,7 @@ repair_potato() {
     service="$(cat "$POTATO_GITHUB_DIR/.service" 2>/dev/null || true)"
     [[ -z "$service" ]] || { systemctl disable --now "$service" 2>/dev/null || true; }
     (cd "$POTATO_GITHUB_DIR" && ./svc.sh uninstall) >/dev/null 2>&1 || true
-    rm -f -- "$POTATO_GITHUB_DIR"/{.runner,.credentials,.credentials_rsaparams,.credentials_migrated,.service,.svcsh,.env,.path,runsvc.sh}
+    rm -f -- "$POTATO_GITHUB_DIR"/{.runner,.runner_migrated,.credentials,.credentials_rsaparams,.credentials_migrated,.service,.svcsh,.env,.path,runsvc.sh}
 
     local token
     token="$(github_registration_token)"
