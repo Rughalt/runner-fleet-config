@@ -575,7 +575,8 @@ cleanup_runner() {
   if [[ "$provider" == github ]]; then
     [[ -n "${GH_TOKEN:-}" ]] || die "GH_TOKEN is required to remove the remote GitHub registration."
     org="$(jq -er '.org' "$STATE_FILE")"; [[ "$ORG" == "$org" ]] || die "ORG differs from managed state ($org)."
-    record="$(github_runner_record)"; id="$(jq -r '.id // empty' <<<"${record:-{}}")"
+    record="$(github_runner_record)"; id=""
+    [[ -z "$record" ]] || id="$(jq -r '.id // empty' <<<"$record")"
     service="$(cat "$GITHUB_DIR/.service" 2>/dev/null || true)"
     [[ -z "$service" ]] || systemctl stop "$service" || true
     [[ -z "$id" ]] || github_api DELETE "/orgs/$ORG/actions/runners/$id" >/dev/null
@@ -588,7 +589,8 @@ cleanup_runner() {
     url="$(jq -er '.forgejo_url' "$STATE_FILE")"; scope="$(jq -er '.forgejo_scope' "$STATE_FILE")"
     [[ "$FORGEJO_URL" == "$url" && "$FORGEJO_SCOPE" == "$scope" ]] \
       || die "Forgejo URL/scope differs from managed state."
-    record="$(forgejo_runner_record)"; id="$(jq -r '.id // empty' <<<"${record:-{}}")"; endpoint="$(forgejo_runner_endpoint)"
+    record="$(forgejo_runner_record)"; id=""; endpoint="$(forgejo_runner_endpoint)"
+    [[ -z "$record" ]] || id="$(jq -r '.id // empty' <<<"$record")"
     systemctl disable --now forgejo-runner.service 2>/dev/null || true
     [[ -z "$id" ]] || forgejo_api DELETE "$endpoint/$id" >/dev/null
     if [[ -f "$FORGEJO_CONFIG_DIR/$MANAGED_MARKER" ]]; then

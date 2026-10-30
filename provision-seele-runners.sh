@@ -1190,7 +1190,8 @@ cleanup_owned_resources() {
         [[ "$(incus config get "$name" user.seele.forgejo_scope)" == "$FORGEJO_SCOPE" ]] \
           || die "Forgejo scope for '$name' differs from FORGEJO_SCOPE; refusing remote deletion."
         record="$(forgejo_runner_record "$name")"
-        runner_id="$(jq -r '.id // empty' <<<"${record:-{}}")"
+        runner_id=""
+        [[ -z "$record" ]] || runner_id="$(jq -r '.id // empty' <<<"$record")"
         if [[ -n "$runner_id" ]]; then
           log "Removing Forgejo runner registration '$name' (id $runner_id)"
           delete_forgejo_runner "$runner_id"

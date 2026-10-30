@@ -471,7 +471,8 @@ repair_github_vm() {
   fi
 
   record="$(github_runner_record "$vm")"
-  status="$(jq -r '.status // empty' <<<"${record:-{}}")"
+  status=""
+  [[ -z "$record" ]] || status="$(jq -r '.status // empty' <<<"$record")"
 
   if ((local_cfg == 1)) && [[ -n "$record" ]]; then
     if plan "would ensure the runner service in '$vm' is enabled and running."; then return; fi
@@ -677,7 +678,8 @@ repair_potato() {
     fi
 
     record="$(github_runner_record "$name")"
-    status="$(jq -r '.status // empty' <<<"${record:-{}}")"
+    status=""
+    [[ -z "$record" ]] || status="$(jq -r '.status // empty' <<<"$record")"
 
     if ((local_cfg == 1)) && [[ -n "$record" ]]; then
       if plan "would ensure the runner service for '$name' is enabled and running."; then return; fi
