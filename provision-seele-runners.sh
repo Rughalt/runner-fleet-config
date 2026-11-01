@@ -1504,15 +1504,17 @@ main() {
     cleanup_owned_resources
     return
   fi
-  preflight_host
-  install_incus
-  ensure_host_swap
+  # Validate the provider token before any host mutation; the access checks
+  # only need curl, so install just that when the host lacks it.
+  command -v curl >/dev/null 2>&1 || host_apt ca-certificates curl
   if [[ "$RUNNER_PROVIDER" == github ]]; then
-    [[ -n "${GH_TOKEN:-}" ]] || die "GH_TOKEN is required; see README for the minimal permission."
     check_github_access
   else
     check_forgejo_access
   fi
+  preflight_host
+  install_incus
+  ensure_host_swap
   ensure_incus_foundation
   ensure_incus_firewall_access
   ensure_base_vm
