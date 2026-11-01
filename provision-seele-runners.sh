@@ -178,9 +178,13 @@ if [[ "$RUNNER_PROVIDER" == forgejo ]]; then
     || die "FORGEJO_URL must be an HTTPS origin such as https://git.example.com (no path)."
   RUNNER_CONNECT_HOST="${BASH_REMATCH[1]}"
   RUNNER_CONNECT_PORT="${BASH_REMATCH[3]:-443}"
+  [[ "$FORGEJO_RUNNER_VERSION" =~ ^(latest|v?[0-9]+\.[0-9]+\.[0-9]+)$ ]] \
+    || die "FORGEJO_RUNNER_VERSION must be 'latest' or a release like 13.1.0 (got '$FORGEJO_RUNNER_VERSION')."
 else
   RUNNER_CONNECT_HOST=api.github.com
   RUNNER_CONNECT_PORT=443
+  [[ "$RUNNER_VERSION" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+)$ ]] \
+    || die "RUNNER_VERSION must be 'latest' or a release like 2.328.0 (got '$RUNNER_VERSION')."
 fi
 
 apt_retry() {
@@ -1432,6 +1436,7 @@ sig_url="$(jq -r --arg a "${asset}.asc" '.assets[] | select(.name == $a) | .brow
 sum_url="$(jq -r --arg a "${asset}.sha256" '.assets[] | select(.name == $a) | .browser_download_url' <<<"$api_json")"
 [[ -n "$url" && -n "$sig_url" && -n "$sum_url" ]] \
   || { echo "Release v${version} lacks $asset, its signature or its checksum." >&2; exit 1; }
+echo "Installing Forgejo Runner v${version} ($asset)"
 
 command -v gpg >/dev/null 2>&1 \
   || { apt-get update; apt-get install -y --no-install-recommends gnupg; }
@@ -1518,6 +1523,7 @@ ensure_forgejo_runner_vm() {
     delete_forgejo_runner "$id"
   fi
 
+  log "🪪 Registering a fresh Forgejo identity for '$name' at $FORGEJO_SCOPE"
   identity="$(forgejo_api POST "$(forgejo_runner_endpoint)" \
     -H 'Content-Type: application/json' \
     --data "$(jq -cn --arg name "$name" '{name:$name, description:"Incus VM managed by provision-seele-runners", ephemeral:false}')")"
@@ -1536,6 +1542,7 @@ ensure_forgejo_runner_vm() {
   incus exec "$name" -- chmod 600 /run/forgejo-runner-config.json
   write_forgejo_runner_install
   incus file push "$TEMP_DIR/forgejo-runner-install.sh" "$name/root/forgejo-runner-install.sh"
+  log "⬇️ Installing Forgejo Runner '$FORGEJO_RUNNER_VERSION' inside '$name'"
   if ! incus exec "$name" -- bash /root/forgejo-runner-install.sh "$FORGEJO_RUNNER_VERSION"; then
     incus exec "$name" -- rm -f /run/forgejo-runner-config.json /root/forgejo-runner-install.sh || true
     die "Forgejo Runner installation failed in $name. Its remote identity was kept for safe inspection."
