@@ -386,12 +386,28 @@ discover_runner_vms() { # prints "name<TAB>provider" for every discovered runner
   done
 }
 
+diagnose_vm_boot() {
+  local vm="$1" line
+  warn "Why '$vm' will not boot — last QEMU lines:"
+  incus info "$vm" --show-log 2>/dev/null | tail -n 15 | while IFS= read -r line; do
+    printf '    %s\n' "$line" >&2
+  done
+  printf '    host storage: / = %s; /var/lib/incus = %s\n' \
+    "$(df -h / 2>/dev/null | awk 'NR==2 {printf "%s free of %s", $4, $2}')" \
+    "$(df -h /var/lib/incus 2>/dev/null | awk 'NR==2 {printf "%s free of %s", $4, $2}')" >&2
+  [[ -e /dev/kvm ]] || printf '    host KVM: /dev/kvm is missing\n' >&2
+  printf '    host memory: %s\n' "$(free -h 2>/dev/null | awk 'NR==2 {printf "%s free of %s", $4, $2}')" >&2
+  dmesg 2>/dev/null | grep -qi 'out of memory\|oom_kill\|oom-kill' \
+    && printf '    kernel OOM events present in dmesg — QEMU may have been killed; check RAM/swap.\n' >&2
+}
+
 wait_for_agent() {
   local vm="$1" tries=90 state
   until incus exec "$vm" -- true >/dev/null 2>&1; do
     state="$(incus list "$vm" --format csv -c s 2>/dev/null | head -n1)"
     if [[ "$state" != RUNNING ]]; then
       warn "$vm stopped while waiting for its Incus agent (state: ${state:-unknown})."
+      diagnose_vm_boot "$vm"
       return 1
     fi
     ((tries-=1))
@@ -414,6 +430,7 @@ ensure_vm_running() {
     fi
     if ! start_err="$(incus start "$vm" 2>&1)"; then
       warn "incus start failed for '$vm': $start_err"
+      diagnose_vm_boot "$vm"
       return 1
     fi
   fi
