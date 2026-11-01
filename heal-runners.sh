@@ -386,9 +386,42 @@ discover_runner_vms() { # prints "name<TAB>provider" for every discovered runner
   done
 }
 
+# A loop-backed pool that ran out of room can only be healed by growing it;
+# cleanup is the alternative. Growth enlarges the image file and lets the
+# pool filesystem fill it — never shrink, and always leave the host margin.
+maybe_grow_pool() {
+  local pool="$1" pool_dir src size_mib avail_mib grow_mib new_gib driver
+  pool_dir="/var/lib/incus/storage-pools/$pool"
+  src="$(incus storage get "$pool" source </dev/null 2>/dev/null || true)"
+  if [[ -z "$src" || ! -f "$src" ]]; then
+    printf '    pool %s is not a loop image (source: %s); grow its backing device or volume manually.\n' \
+      "$pool" "${src:-unknown}" >&2
+    return 0
+  fi
+  size_mib="$(df -m --output=size "$pool_dir" | awk 'NR==2 {print $1}')"
+  avail_mib="$(df -m --output=avail "$(dirname "$src")" | awk 'NR==2 {print $1}')"
+  [[ "$size_mib" =~ ^[0-9]+$ && "$avail_mib" =~ ^[0-9]+$ ]] || return 0
+  grow_mib=$(( size_mib / 2 ))
+  (( grow_mib < 16384 )) && grow_mib=16384
+  (( grow_mib > avail_mib - 8192 )) && grow_mib=$(( avail_mib - 8192 ))
+  if (( grow_mib < 1024 )); then
+    warn "Pool '$pool' is a loop image but its backing filesystem has under 9 GiB free; free host space or move the pool."
+    return 0
+  fi
+  new_gib=$(( (size_mib + grow_mib + 1023) / 1024 ))
+  plan "would grow Incus pool '$pool' to ${new_gib}GiB (backing file has ${avail_mib}MiB free)." && return 0
+  if incus storage set "$pool" size="${new_gib}GiB" </dev/null; then
+    driver="$(incus storage get "$pool" driver </dev/null 2>/dev/null || true)"
+    # size= grows the image; make sure the filesystem filled it too.
+    [[ "$driver" == btrfs ]] && btrfs filesystem resize max "$pool_dir" >/dev/null 2>&1 || true
+    log "Grew Incus pool '$pool' to ${new_gib}GiB."
+  else
+    warn "Failed to grow Incus pool '$pool'; enlarge '$src' and resize its filesystem manually."
+  fi
+}
+
 # A nearly full loop-backed pool kills QEMU the moment a VM starts: the
 # backing file lives on /var and cannot hand out blocks the guest expects.
-# Report every pressured pool with its grow/free options.
 report_pool_pressure() {
   local pool pool_dir pct size avail
   while IFS= read -r pool; do
@@ -397,7 +430,7 @@ report_pool_pressure() {
     read -r pct size avail < <(df -h --output=pcent,size,avail "$pool_dir" 2>/dev/null | awk 'NR==2 {print $1, $2, $3}')
     [[ "${pct%\%}" =~ ^[0-9]+$ && "${pct%\%}" -ge 90 ]] || continue
     warn "Incus pool '$pool' is $pct full ($avail available of $size)."
-    printf '    grow: sudo incus storage set %s size=<bigger>GiB\n' "$pool" >&2
+    maybe_grow_pool "$pool"
     printf '    free: sudo ./cleanup-runner-disks.sh\n' >&2
   done < <(incus storage list --format csv -c n 2>/dev/null)
 }
