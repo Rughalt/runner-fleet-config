@@ -1067,15 +1067,34 @@ ensure_base_vm() {
   log "✨ Golden Trotter sealed as '$BASE_VM/$GOLDEN_SNAPSHOT'."
 }
 
+# Runs one provider API call and prints the response body on stdout. Transient
+# failures (transport errors, 408, 429, 5xx) are retried; a final failure names
+# the request and echoes the API error on stderr, because "curl: (22) 404" x5
+# says nothing about which endpoint rejected the call.
 github_api() {
-  local method="$1" path="$2"
+  local method="$1" path="$2" status body attempt
   shift 2
-  curl -fsSL --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
-    -X "$method" \
-    -H 'Accept: application/vnd.github+json' \
-    -H "Authorization: Bearer $GH_TOKEN" \
-    -H 'X-GitHub-Api-Version: 2022-11-28' \
-    "https://api.github.com${path}" "$@"
+  body="$(mktemp)"
+  for attempt in 1 2 3 4 5; do
+    status="$(curl -sSL --connect-timeout 10 --max-time 60 \
+      -X "$method" \
+      -H 'Accept: application/vnd.github+json' \
+      -H "Authorization: Bearer $GH_TOKEN" \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      -o "$body" -w '%{http_code}' \
+      "https://api.github.com${path}" "$@")" || status=000
+    [[ "$status" =~ ^(000|408|429|5..)$ ]] && ((attempt < 5)) || break
+    sleep "$attempt"
+  done
+  if [[ "$status" =~ ^2 ]]; then
+    cat -- "$body"
+    rm -f -- "$body"
+    return 0
+  fi
+  printf 'GitHub API %s %s failed with HTTP %s' "$method" "$path" "$status" >&2
+  [[ -s "$body" ]] && printf ': %s\n' "$(<"$body")" >&2 || printf '.\n' >&2
+  rm -f -- "$body"
+  return 1
 }
 
 check_github_access() {
@@ -1102,19 +1121,37 @@ forgejo_runner_endpoint() {
 }
 
 forgejo_api() {
-  local method="$1" path="$2"
+  local method="$1" path="$2" status body attempt
   shift 2
-  curl -fsSL --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
-    -X "$method" -H 'Accept: application/json' \
-    -H "Authorization: Bearer $FORGEJO_API_TOKEN" \
-    "$FORGEJO_URL$path" "$@"
+  body="$(mktemp)"
+  for attempt in 1 2 3 4 5; do
+    status="$(curl -sSL --connect-timeout 10 --max-time 60 \
+      -X "$method" -H 'Accept: application/json' \
+      -H "Authorization: Bearer $FORGEJO_API_TOKEN" \
+      -o "$body" -w '%{http_code}' \
+      "$FORGEJO_URL$path" "$@")" || status=000
+    [[ "$status" =~ ^(000|408|429|5..)$ ]] && ((attempt < 5)) || break
+    sleep "$attempt"
+  done
+  if [[ "$status" =~ ^2 ]]; then
+    cat -- "$body"
+    rm -f -- "$body"
+    return 0
+  fi
+  printf 'Forgejo API %s %s%s failed with HTTP %s' "$method" "$FORGEJO_URL" "$path" "$status" >&2
+  [[ -s "$body" ]] && printf ': %s\n' "$(<"$body")" >&2 || printf '.\n' >&2
+  rm -f -- "$body"
+  return 1
 }
 
 check_forgejo_access() {
   [[ -n "$FORGEJO_API_TOKEN" ]] || die "FORGEJO_API_TOKEN is required for automatic Forgejo runner creation."
-  local endpoint
+  local endpoint version
   endpoint="$(forgejo_runner_endpoint)"
   log "🪄 Lux checks the path to Forgejo runners at $FORGEJO_URL ($FORGEJO_SCOPE)"
+  version="$(curl -fsSL --connect-timeout 10 --max-time 30 "$FORGEJO_URL/api/v1/version" \
+    | jq -er '.version' 2>/dev/null || true)"
+  [[ -z "$version" ]] || log "Forgejo instance reports version $version; API runner registration needs 15+."
   forgejo_api GET "$endpoint" >/dev/null \
     || die "FORGEJO_API_TOKEN cannot administer $FORGEJO_SCOPE runners at $FORGEJO_URL."
 }
