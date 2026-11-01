@@ -434,7 +434,9 @@ sudo ./provision-seele-runners.sh
 ```
 
 This produces `lux-poro-01`, `lux-poro-02`, and so on. Each clone downloads the
-pinned Forgejo Runner, receives only its own connection credential, and starts
+pinned Forgejo Runner (or `latest`), verifies its detached signature against
+Forgejo's release-signing fingerprint plus the published SHA-256 checksum,
+receives only its own connection credential, and starts
 `forgejo-runner.service` as the unprivileged `runner` user with Docker access.
 The API token never enters a VM or the golden snapshot. Forgejo Runner v13 needs
 Docker 25 or newer and the script checks this before installing the service.

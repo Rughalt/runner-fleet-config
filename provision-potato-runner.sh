@@ -451,7 +451,7 @@ install_forgejo_binary() {
   install -d -m 0700 "$gpg_home"
   GNUPGHOME="$gpg_home" gpg --batch --import "$signing_key" >/dev/null
   GNUPGHOME="$gpg_home" gpg --batch --status-fd 1 --verify "$signature" "$binary" \
-    | grep -q 'VALIDSIG EB114F5E6C0DC2BCDD183550A4B61A2DC5923710'
+    | grep -q 'VALIDSIG .* EB114F5E6C0DC2BCDD183550A4B61A2DC5923710$'
   fingerprint="$(GNUPGHOME="$gpg_home" gpg --batch --with-colons --fingerprint EB114F5E6C0DC2BCDD183550A4B61A2DC5923710 | awk -F: '$1=="fpr" {print $10; exit}')"
   [[ "$fingerprint" == EB114F5E6C0DC2BCDD183550A4B61A2DC5923710 ]] || die "Unexpected Forgejo release signing key."
   install -o root -g root -m 0755 "$binary" /usr/local/bin/forgejo-runner

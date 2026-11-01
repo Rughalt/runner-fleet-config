@@ -1369,7 +1369,7 @@ write_forgejo_runner_install() {
   cat >"$TEMP_DIR/forgejo-runner-install.sh" <<'GUEST'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-VERSION="$1"
+requested="${1#v}"
 docker_server="$(docker version --format '{{.Server.Version}}')"
 dpkg --compare-versions "${docker_server%%-*}" ge 25.0 \
   || { echo "Forgejo Runner v13 requires Docker >=25; found $docker_server" >&2; exit 1; }
@@ -1379,11 +1379,44 @@ case "$(dpkg --print-architecture)" in
   *) echo "Unsupported guest architecture" >&2; exit 1 ;;
 esac
 
-url="https://code.forgejo.org/forgejo/runner/releases/download/v${VERSION}/forgejo-runner-${VERSION}-linux-${runner_arch}"
-tmp="$(mktemp)"
-trap 'rm -f -- "$tmp" /run/forgejo-runner-config.json' EXIT
-curl -fL --retry 5 --retry-all-errors --connect-timeout 10 --max-time 900 "$url" -o "$tmp"
-install -o root -g root -m 0755 "$tmp" /usr/local/bin/forgejo-runner
+api_json="$(curl -fsSL --retry 5 --retry-all-errors --connect-timeout 10 --max-time 60 \
+  https://code.forgejo.org/api/v1/repos/forgejo/runner/releases/latest)"
+latest="$(jq -r '.tag_name | ltrimstr("v")' <<<"$api_json")"
+version="$requested"
+[[ "$version" != latest ]] || version="$latest"
+asset="forgejo-runner-${version}-linux-${runner_arch}"
+if [[ "$version" != "$latest" ]]; then
+  api_json="$(curl -fsSL --retry 5 --retry-all-errors --connect-timeout 10 --max-time 60 \
+    "https://code.forgejo.org/api/v1/repos/forgejo/runner/releases/tags/v${version}")" \
+    || { echo "No Forgejo Runner release v${version} exists." >&2; exit 1; }
+fi
+url="$(jq -r --arg a "$asset" '.assets[] | select(.name == $a) | .browser_download_url' <<<"$api_json")"
+sig_url="$(jq -r --arg a "${asset}.asc" '.assets[] | select(.name == $a) | .browser_download_url' <<<"$api_json")"
+sum_url="$(jq -r --arg a "${asset}.sha256" '.assets[] | select(.name == $a) | .browser_download_url' <<<"$api_json")"
+[[ -n "$url" && -n "$sig_url" && -n "$sum_url" ]] \
+  || { echo "Release v${version} lacks $asset, its signature or its checksum." >&2; exit 1; }
+
+command -v gpg >/dev/null 2>&1 \
+  || { apt-get update; apt-get install -y --no-install-recommends gnupg; }
+
+tmp="$(mktemp -d)"
+trap 'rm -rf -- "$tmp" /run/forgejo-runner-config.json' EXIT
+curl -fL --retry 5 --retry-all-errors --connect-timeout 10 --max-time 900 "$url" -o "$tmp/$asset"
+curl -fsSL --retry 5 --retry-all-errors --connect-timeout 10 --max-time 120 "$sig_url" -o "$tmp/$asset.asc"
+curl -fsSL --retry 5 --retry-all-errors --connect-timeout 10 --max-time 120 "$sum_url" -o "$tmp/$asset.sha256"
+(cd "$tmp" && sha256sum -c "$asset.sha256" >/dev/null)
+curl -fsSL --retry 5 --retry-all-errors --connect-timeout 10 --max-time 120 \
+  'https://keys.openpgp.org/vks/v1/by-fingerprint/EB114F5E6C0DC2BCDD183550A4B61A2DC5923710' \
+  -o "$tmp/forgejo-signing-key.asc"
+install -d -m 0700 "$tmp/gnupg"
+GNUPGHOME="$tmp/gnupg" gpg --batch --import "$tmp/forgejo-signing-key.asc" >/dev/null
+GNUPGHOME="$tmp/gnupg" gpg --batch --status-fd 1 --verify "$tmp/$asset.asc" "$tmp/$asset" \
+  | grep -q 'VALIDSIG .* EB114F5E6C0DC2BCDD183550A4B61A2DC5923710$'
+fingerprint="$(GNUPGHOME="$tmp/gnupg" gpg --batch --with-colons --fingerprint \
+  EB114F5E6C0DC2BCDD183550A4B61A2DC5923710 | awk -F: '$1=="fpr" {print $10; exit}')"
+[[ "$fingerprint" == EB114F5E6C0DC2BCDD183550A4B61A2DC5923710 ]] \
+  || { echo "Unexpected Forgejo release signing key." >&2; exit 1; }
+install -o root -g root -m 0755 "$tmp/$asset" /usr/local/bin/forgejo-runner
 install -o runner -g runner -m 0600 /run/forgejo-runner-config.json /home/runner/runner-config.yml
 install -d -o runner -g runner -m 0755 /home/runner/.cache/act
 
