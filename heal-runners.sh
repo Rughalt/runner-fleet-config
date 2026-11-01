@@ -386,6 +386,22 @@ discover_runner_vms() { # prints "name<TAB>provider" for every discovered runner
   done
 }
 
+# A nearly full loop-backed pool kills QEMU the moment a VM starts: the
+# backing file lives on /var and cannot hand out blocks the guest expects.
+# Report every pressured pool with its grow/free options.
+report_pool_pressure() {
+  local pool pool_dir pct size avail
+  while IFS= read -r pool; do
+    pool_dir="/var/lib/incus/storage-pools/$pool"
+    [[ -d "$pool_dir" ]] || continue
+    read -r pct size avail < <(df -h --output=pcent,size,avail "$pool_dir" 2>/dev/null | awk 'NR==2 {print $1, $2, $3}')
+    [[ "${pct%\%}" =~ ^[0-9]+$ && "${pct%\%}" -ge 90 ]] || continue
+    warn "Incus pool '$pool' is $pct full ($avail available of $size)."
+    printf '    grow: sudo incus storage set %s size=<bigger>GiB\n' "$pool" >&2
+    printf '    free: sudo ./cleanup-runner-disks.sh\n' >&2
+  done < <(incus storage list --format csv -c n 2>/dev/null)
+}
+
 diagnose_vm_boot() {
   local vm="$1" line
   warn "Why '$vm' will not boot — last QEMU lines:"
@@ -395,6 +411,7 @@ diagnose_vm_boot() {
   printf '    host storage: / = %s; /var/lib/incus = %s\n' \
     "$(df -h / 2>/dev/null | awk 'NR==2 {printf "%s free of %s", $4, $2}')" \
     "$(df -h /var/lib/incus 2>/dev/null | awk 'NR==2 {printf "%s free of %s", $4, $2}')" >&2
+  report_pool_pressure
   [[ -e /dev/kvm ]] || printf '    host KVM: /dev/kvm is missing\n' >&2
   printf '    host memory: %s\n' "$(free -h 2>/dev/null | awk 'NR==2 {printf "%s free of %s", $4, $2}')" >&2
   dmesg 2>/dev/null | grep -qi 'out of memory\|oom_kill\|oom-kill' \
@@ -1004,6 +1021,7 @@ main() {
   fi
   if ((DO_INCUS == 1)); then
     incus admin waitready --timeout=60
+    report_pool_pressure
     mkdir -p /run/lock
     exec 9>/run/lock/seele-runners.lock
     flock -n 9 || die "The runner provisioner or another maintenance run is active. Stop it or wait for it to finish."
