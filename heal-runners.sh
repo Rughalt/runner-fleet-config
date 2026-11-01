@@ -396,7 +396,7 @@ wait_for_agent() {
     fi
     ((tries-=1))
     if ((tries <= 0)); then
-      warn "$vm agent did not become available within 180 seconds."
+      warn "$vm agent did not become available within 180 seconds; inspect boot with 'incus console $vm --show-log'."
       return 1
     fi
     sleep 2
@@ -404,7 +404,7 @@ wait_for_agent() {
 }
 
 ensure_vm_running() {
-  local vm="$1" state
+  local vm="$1" state start_err
   state="$(incus list "$vm" --format csv -c s 2>/dev/null | head -n1)"
   if [[ "$state" != RUNNING ]]; then
     if plan "would start/recover VM '$vm' (state: ${state:-unknown})."; then return 2; fi
@@ -412,7 +412,10 @@ ensure_vm_running() {
       warn "$vm is in Incus ERROR state; force-stopping to clear stale QEMU state."
       incus stop "$vm" --force >/dev/null 2>&1 || true
     fi
-    incus start "$vm" >/dev/null 2>&1 || true
+    if ! start_err="$(incus start "$vm" 2>&1)"; then
+      warn "incus start failed for '$vm': $start_err"
+      return 1
+    fi
   fi
   wait_for_agent "$vm"
 }
